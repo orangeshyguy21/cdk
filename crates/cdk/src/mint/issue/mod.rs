@@ -699,7 +699,13 @@ impl Mint {
         }
 
         let unit = unit.ok_or(Error::UnsupportedUnit).unwrap();
-        ensure_cdk!(unit == mint_quote.unit, Error::UnsupportedUnit);
+        if unit != mint_quote.unit {
+            tracing::error!(
+                "Mint outputs unit mismatch: outputs={:?} quote={:?}. Ensure the wallet constructs outputs using the {:?} keyset.",
+                unit, mint_quote.unit, mint_quote.unit
+            );
+            return Err(Error::UnsupportedUnit);
+        }
 
         tx.add_blind_signatures(
             &mint_request

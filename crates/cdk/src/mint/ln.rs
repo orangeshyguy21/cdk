@@ -56,7 +56,11 @@ impl Mint {
                     quote.id
                 );
 
-                let amount_paid = to_unit(payment.payment_amount, &payment.unit, &quote.unit)?;
+                let amount_paid = if payment.unit == quote.unit {
+                    payment.payment_amount
+                } else {
+                    to_unit(payment.payment_amount, &payment.unit, &quote.unit)?
+                };
 
                 quote.increment_amount_paid(amount_paid)?;
                 quote.add_payment(amount_paid, payment.payment_id.clone(), unix_time())?;

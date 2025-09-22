@@ -48,6 +48,9 @@ pub mod routerrpc {
     tonic::include_proto!("routerrpc");
 }
 
+const LITD_KV_PRIMARY_NAMESPACE: &str = "litd";
+const LITD_KV_ASSET_INVOICE_SECONDARY: &str = "asset_invoice";
+
 #[derive(Clone)]
 pub struct Litd {
     _address: String,
@@ -205,6 +208,39 @@ impl Litd {
         };
         let response = client.new_addr(Request::new(req)).await.map_err(|e| payment::Error::Anyhow(anyhow!(e)))?.into_inner();
         Ok(response.encoded)
+    }
+
+    async fn kv_write_asset_amount(&self, payment_hash_hex: &str, asset_amount: u64) {
+        if let Ok(mut tx) = self._kv_store.begin_transaction().await {
+            let _ = tx
+                .kv_write(
+                    LITD_KV_PRIMARY_NAMESPACE,
+                    LITD_KV_ASSET_INVOICE_SECONDARY,
+                    payment_hash_hex,
+                    asset_amount.to_string().as_bytes(),
+                )
+                .await;
+            let _ = tx.commit().await;
+        }
+    }
+
+    async fn kv_read_asset_amount(&self, payment_hash_hex: &str) -> Option<u64> {
+        if let Ok(Some(bytes)) = self
+            ._kv_store
+            .kv_read(
+                LITD_KV_PRIMARY_NAMESPACE,
+                LITD_KV_ASSET_INVOICE_SECONDARY,
+                payment_hash_hex,
+            )
+            .await
+        {
+            if let Ok(s) = std::str::from_utf8(&bytes) {
+                if let Ok(v) = s.parse::<u64>() {
+                    return Some(v);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -379,6 +415,9 @@ impl MintPayment for Litd {
                 let payment_identifier = if r_hash.len() == 32 {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&r_hash);
+                    // persist asset amount mapping for later settlement checks
+                    let ph_hex = hex::encode(arr);
+                    self.kv_write_asset_amount(&ph_hex, amount).await;
                     PaymentIdentifier::PaymentHash(arr)
                 } else {
                     PaymentIdentifier::CustomId(bolt11.clone())
@@ -504,6 +543,7 @@ impl MintPayment for Litd {
     fn cancel_wait_invoice(&self) {}
 
     async fn check_incoming_payment_status(&self, payment_identifier: &PaymentIdentifier) -> Result<Vec<payment::WaitPaymentResponse>, Self::Err> {
+        // First, use LND to determine settlement status
         let fee_reserve = FeeReserve { min_fee_reserve: self.fee_reserve.min_fee_reserve, percent_fee_reserve: self.fee_reserve.percent_fee_reserve };
         let lnd = cdk_lnd::Lnd::new(
             self._address.clone(),
@@ -514,7 +554,27 @@ impl MintPayment for Litd {
         )
         .await
         .map_err(|e| payment::Error::Anyhow(anyhow!(e)))?;
-        lnd.check_incoming_payment_status(payment_identifier).await
+        let responses = lnd.check_incoming_payment_status(payment_identifier).await?;
+
+        // If we have an asset mapping for this payment hash, convert the unit to USD and amount to asset units
+        let mut converted: Vec<payment::WaitPaymentResponse> = Vec::with_capacity(responses.len());
+        for r in responses.into_iter() {
+            if let PaymentIdentifier::PaymentHash(ph) = &r.payment_identifier {
+                let key = hex::encode(ph);
+                if let Some(asset_units) = self.kv_read_asset_amount(&key).await {
+                    converted.push(payment::WaitPaymentResponse {
+                        payment_identifier: r.payment_identifier,
+                        payment_amount: Amount::from(asset_units),
+                        unit: CurrencyUnit::Usd,
+                        payment_id: r.payment_id,
+                    });
+                    continue;
+                }
+            }
+            converted.push(r);
+        }
+
+        Ok(converted)
     }
 
     async fn check_outgoing_payment(&self, payment_identifier: &PaymentIdentifier) -> Result<MakePaymentResponse, Self::Err> {
