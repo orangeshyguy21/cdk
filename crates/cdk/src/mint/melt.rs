@@ -142,9 +142,48 @@ impl Mint {
             ..
         } = melt_request;
 
-        let amount_msats = melt_request.amount_msat()?;
+        // Build outgoing payment options upfront
+        let bolt11_opts = Bolt11OutgoingPaymentOptions {
+            bolt11: melt_request.request.clone(),
+            max_fee_amount: None,
+            timeout_secs: None,
+            melt_options: melt_request.options,
+        };
 
-        let amount_quote_unit = to_unit(amount_msats, &CurrencyUnit::Msat, unit)?;
+        // For USD invoices, resolve the asset amount via backend instead of converting from msats
+        // to avoid unit conversion errors.
+        let mut pre_payment_quote: Option<cdk_common::payment::PaymentQuoteResponse> = None;
+        let amount_quote_unit = if *unit == CurrencyUnit::Usd {
+            let ln = self
+                .payment_processors
+                .get(&PaymentProcessorKey::new(
+                    unit.clone(),
+                    PaymentMethod::Bolt11,
+                ))
+                .ok_or_else(|| {
+                    tracing::info!("Could not get ln backend for {}, bolt11 ", unit);
+                    Error::UnsupportedUnit
+                })?;
+            let pq = ln
+                .get_payment_quote(
+                    unit,
+                    OutgoingPaymentOptions::Bolt11(Box::new(bolt11_opts.clone())),
+                )
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        "Could not get payment quote for melt quote, {} bolt11, {}",
+                        unit, err
+                    );
+                    Error::UnsupportedUnit
+                })?;
+            let amt = pq.amount;
+            pre_payment_quote = Some(pq);
+            amt
+        } else {
+            let amount_msats = melt_request.amount_msat()?;
+            to_unit(amount_msats, &CurrencyUnit::Msat, unit)?
+        };
 
         self.check_melt_request_acceptable(
             amount_quote_unit,
@@ -155,6 +194,7 @@ impl Mint {
         )
         .await?;
 
+        // Get LN backend and payment quote (reuse precomputed for USD)
         let ln = self
             .payment_processors
             .get(&PaymentProcessorKey::new(
@@ -163,38 +203,32 @@ impl Mint {
             ))
             .ok_or_else(|| {
                 tracing::info!("Could not get ln backend for {}, bolt11 ", unit);
-
                 Error::UnsupportedUnit
             })?;
 
-        let bolt11 = Bolt11OutgoingPaymentOptions {
-            bolt11: melt_request.request.clone(),
-            max_fee_amount: None,
-            timeout_secs: None,
-            melt_options: melt_request.options,
+        let payment_quote = match pre_payment_quote {
+            Some(pq) => pq,
+            None => {
+                ln.get_payment_quote(
+                    &melt_request.unit,
+                    OutgoingPaymentOptions::Bolt11(Box::new(bolt11_opts)),
+                )
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        "Could not get payment quote for mint quote, {} bolt11, {}",
+                        unit, err
+                    );
+                    #[cfg(feature = "prometheus")]
+                    {
+                        METRICS.dec_in_flight_requests("get_melt_bolt11_quote");
+                        METRICS.record_mint_operation("get_melt_bolt11_quote", false);
+                        METRICS.record_error();
+                    }
+                    Error::UnsupportedUnit
+                })?
+            }
         };
-
-        let payment_quote = ln
-            .get_payment_quote(
-                &melt_request.unit,
-                OutgoingPaymentOptions::Bolt11(Box::new(bolt11)),
-            )
-            .await
-            .map_err(|err| {
-                tracing::error!(
-                    "Could not get payment quote for mint quote, {} bolt11, {}",
-                    unit,
-                    err
-                );
-
-                #[cfg(feature = "prometheus")]
-                {
-                    METRICS.dec_in_flight_requests("get_melt_bolt11_quote");
-                    METRICS.record_mint_operation("get_melt_bolt11_quote", false);
-                    METRICS.record_error();
-                }
-                Error::UnsupportedUnit
-            })?;
 
         let melt_ttl = self.quote_ttl().await?.melt_ttl;
 

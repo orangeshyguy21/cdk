@@ -258,6 +258,23 @@ pub(crate) async fn post_mint_bolt11(
             .map_err(into_response)?;
     }
 
+    // Debug payload details: outputs count, total, and per-output info
+    let outputs_count = payload.outputs.len();
+    let outputs_total = payload.total_amount().unwrap_or_default();
+    let sample_outputs: Vec<(cdk::nuts::Id, cdk::Amount)> = payload
+        .outputs
+        .iter()
+        .take(10)
+        .map(|o| (o.keyset_id, o.amount))
+        .collect();
+    tracing::info!(
+        "mint/bolt11: quote={} outputs_count={} outputs_total={} sample_outputs={:?}",
+        payload.quote,
+        outputs_count,
+        outputs_total,
+        sample_outputs
+    );
+
     let res = state
         .mint
         .process_mint_request(payload)
@@ -383,6 +400,36 @@ pub(crate) async fn post_melt_bolt11(
             .await
             .map_err(into_response)?;
     }
+
+    use std::collections::HashMap;
+    let inputs_count = payload.inputs().len();
+    let inputs_total = payload.inputs_amount().unwrap_or_default();
+    let mut inputs_by_keyset: HashMap<cdk::nuts::Id, cdk::Amount> = HashMap::new();
+    for p in payload.inputs() {
+        *inputs_by_keyset.entry(p.keyset_id).or_insert(cdk::Amount::ZERO) += p.amount;
+    }
+    let (outputs_count, outputs_total, outputs_by_keyset) = match payload.outputs() {
+        Some(outs) => {
+            let mut by_keyset: HashMap<cdk::nuts::Id, cdk::Amount> = HashMap::new();
+            let mut tot = cdk::Amount::ZERO;
+            for o in outs {
+                *by_keyset.entry(o.keyset_id).or_insert(cdk::Amount::ZERO) += o.amount;
+                tot += o.amount;
+            }
+            (outs.len(), tot, by_keyset)
+        }
+        None => (0usize, cdk::Amount::ZERO, HashMap::new()),
+    };
+    tracing::info!(
+        "melt/bolt11: quote={} inputs_count={} inputs_total={} inputs_by_keyset={:?} outputs_count={} outputs_total={} outputs_by_keyset={:?}",
+        payload.quote_id(),
+        inputs_count,
+        inputs_total,
+        inputs_by_keyset,
+        outputs_count,
+        outputs_total,
+        outputs_by_keyset
+    );
 
     let res = state.mint.melt(&payload).await.map_err(into_response)?;
 

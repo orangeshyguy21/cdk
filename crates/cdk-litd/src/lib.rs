@@ -453,12 +453,34 @@ impl MintPayment for Litd {
                 lnd.get_payment_quote(unit, options).await
             }
             CurrencyUnit::Usd => {
-                // Quote: we return 0 fee for TA (fees are L1 and proof courier; not included)
-                // Amount is taken from the TA address itself, so we parse it if needed
-                let amount = match &options {
-                    OutgoingPaymentOptions::Bolt11(_) => Amount::ZERO,
-                    OutgoingPaymentOptions::Bolt12(_) => Amount::ZERO,
+                // Decode the asset-aware invoice to obtain the asset amount in USD units
+                let bolt11 = match &options {
+                    OutgoingPaymentOptions::Bolt11(b) => b.bolt11.to_string(),
+                    OutgoingPaymentOptions::Bolt12(_) => return Err(payment::Error::UnsupportedUnit),
                 };
+
+                // Use the first allowed group key for decoding
+                let group_key_hex = self
+                    .allowed_usd_group_ids
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| payment::Error::Custom("No usd_group_ids configured".to_string()))?;
+                let group_key = hex::decode(&group_key_hex).map_err(|e| payment::Error::Anyhow(anyhow!(e)))?;
+
+                let mut client = self.tap_channel_client().await?;
+                let decoded = client
+                    .decode_asset_pay_req(Request::new(tapchannelrpc::AssetPayReq {
+                        asset_id: vec![],
+                        pay_req_string: bolt11,
+                        group_key,
+                        price_oracle_metadata: String::new(),
+                    }))
+                    .await
+                    .map_err(|e| payment::Error::Anyhow(anyhow!(e)))?
+                    .into_inner();
+
+                let amount = Amount::from(decoded.asset_amount);
+
                 Ok(PaymentQuoteResponse {
                     request_lookup_id: None,
                     amount,
@@ -491,39 +513,64 @@ impl MintPayment for Litd {
                 lnd.make_payment(unit, options).await
             }
             CurrencyUnit::Usd => {
-                // Expect request is the TAP address string in melt quote
-                let addr = match &options {
+                // Pay an asset-aware Lightning invoice via TaprootAssetChannels.SendPayment
+                let bolt11 = match &options {
                     OutgoingPaymentOptions::Bolt11(b) => b.bolt11.to_string(),
                     OutgoingPaymentOptions::Bolt12(_) => return Err(payment::Error::UnsupportedUnit),
                 };
 
-                // Validate allowlist
-                let mut client = self.ta_client().await?;
-                let decoded = client.decode_addr(Request::new(taprpc::DecodeAddrRequest { addr: addr.clone() }))
+                // Choose a group key (allow any configured)
+                let group_key_hex = self
+                    .allowed_usd_group_ids
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| payment::Error::Custom("No usd_group_ids configured".to_string()))?;
+                let group_key = hex::decode(&group_key_hex).map_err(|e| payment::Error::Anyhow(anyhow!(e)))?;
+
+                let mut client = self.tap_channel_client().await?;
+
+                // Optional: decode to validate invoice maps to asset units
+                let _decoded = client
+                    .decode_asset_pay_req(Request::new(tapchannelrpc::AssetPayReq {
+                        asset_id: vec![],
+                        pay_req_string: bolt11.clone(),
+                        group_key: group_key.clone(),
+                        price_oracle_metadata: String::new(),
+                    }))
+                    .await
+                    .map_err(|e| payment::Error::Anyhow(anyhow!(e)))?;
+
+                let router_req = routerrpc::SendPaymentRequest {
+                    payment_request: bolt11.clone(),
+                    ..Default::default()
+                };
+                let req = tapchannelrpc::SendPaymentRequest {
+                    asset_id: vec![],
+                    asset_amount: 0,
+                    peer_pubkey: vec![],
+                    payment_request: Some(router_req),
+                    rfq_id: vec![],
+                    allow_overpay: false,
+                    group_key,
+                    price_oracle_metadata: String::new(),
+                };
+
+                // Stream results until we get a payment result
+                let mut stream = client
+                    .send_payment(Request::new(req))
                     .await
                     .map_err(|e| payment::Error::Anyhow(anyhow!(e)))?
                     .into_inner();
-
-                // decoded is taprpc::Addr
-                let group_hex = hex::encode(decoded.group_key);
-                if !self.validate_usd_group_id(&group_hex) {
-                    return Err(payment::Error::Custom("Unsupported USD asset group id".to_string()));
+                // Consume first message if any; ignore contents for now
+                match stream.message().await {
+                    Ok(_msg) => {}
+                    Err(e) => {
+                        return Err(payment::Error::Custom(e.to_string()));
+                    }
                 }
 
-                // Send the asset
-                let _send = client.send_asset(Request::new(taprpc::SendAssetRequest {
-                    tap_addrs: vec![addr.clone()],
-                    fee_rate: 0,
-                    label: String::new(),
-                    skip_proof_courier_ping_check: false,
-                    addresses_with_amounts: vec![],
-                }))
-                .await
-                .map_err(|e| payment::Error::Anyhow(anyhow!(e)))?
-                .into_inner();
-
                 Ok(MakePaymentResponse {
-                    payment_lookup_id: PaymentIdentifier::CustomId(addr),
+                    payment_lookup_id: PaymentIdentifier::CustomId(bolt11),
                     payment_proof: None,
                     status: MeltQuoteState::Paid,
                     total_spent: Amount::ZERO,
