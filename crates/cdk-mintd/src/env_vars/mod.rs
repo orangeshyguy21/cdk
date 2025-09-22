@@ -23,6 +23,7 @@ mod ldk_node;
 mod lnbits;
 #[cfg(feature = "lnd")]
 mod lnd;
+mod litd;
 #[cfg(feature = "management-rpc")]
 mod management_rpc;
 #[cfg(feature = "prometheus")]
@@ -49,6 +50,7 @@ pub use ln::*;
 pub use lnbits::*;
 #[cfg(feature = "lnd")]
 pub use lnd::*;
+pub use litd::*;
 #[cfg(feature = "management-rpc")]
 pub use management_rpc::*;
 pub use mint_info::*;
@@ -94,6 +96,17 @@ impl Settings {
         self.mint_info = self.mint_info.clone().from_env();
         self.ln = self.ln.clone().from_env();
 
+        // Assets config
+        // CDK_MINTD_USD_GROUP_IDS="gid1,gid2"
+        if let Ok(usd_gids) = env::var("CDK_MINTD_USD_GROUP_IDS") {
+            let parsed: Vec<String> = usd_gids
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.assets.usd_group_ids = parsed;
+        }
+
         #[cfg(feature = "auth")]
         {
             // Check env vars for auth config even if None
@@ -138,6 +151,9 @@ impl Settings {
             #[cfg(feature = "lnd")]
             LnBackend::Lnd => {
                 self.lnd = Some(self.lnd.clone().unwrap_or_default().from_env());
+            }
+            LnBackend::Litd => {
+                self.litd = Some(self.litd.clone().unwrap_or_default().from_env());
             }
             #[cfg(feature = "ldk-node")]
             LnBackend::LdkNode => {

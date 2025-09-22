@@ -343,8 +343,13 @@ async fn configure_mint_builder(
     let mint_builder = configure_basic_info(settings, mint_builder);
 
     // Configure lightning backend
-    let mint_builder =
+    let mut mint_builder =
         configure_lightning_backend(settings, mint_builder, runtime, work_dir, kv_store).await?;
+
+    // If USD assets are configured, ensure USD unit derivation path is set for signatory
+    if !settings.assets.usd_group_ids.is_empty() {
+        mint_builder = mint_builder.with_supported_unit(CurrencyUnit::Usd);
+    }
 
     // Configure caching
     let mint_builder = configure_cache(settings, mint_builder);
@@ -463,7 +468,7 @@ async fn configure_lightning_backend(
         LnBackend::Lnd => {
             let lnd_settings = settings.clone().lnd.expect("Checked at config load");
             let lnd = lnd_settings
-                .setup(settings, CurrencyUnit::Msat, None, work_dir, _kv_store)
+                .setup(settings, CurrencyUnit::Msat, None, work_dir, _kv_store.clone())
                 .await?;
             #[cfg(feature = "prometheus")]
             let lnd = MetricsMintPayment::new(lnd);
@@ -476,6 +481,9 @@ async fn configure_lightning_backend(
                 Arc::new(lnd),
             )
             .await?;
+
+            // NOTE: Do NOT register USD with LND Bolt11 backend.
+            // USD requires Taproot Asset invoices, which are not provided by the BTC Bolt11 LND path yet.
         }
         #[cfg(feature = "fakewallet")]
         LnBackend::FakeWallet => {
@@ -545,6 +553,39 @@ async fn configure_lightning_backend(
                 CurrencyUnit::Sat,
                 mint_melt_limits,
                 Arc::new(ldk_node),
+            )
+            .await?;
+        }
+        LnBackend::Litd => {
+            let litd_settings = settings.clone().litd.expect("litd config defined");
+            let litd_sat = litd_settings
+                .setup(settings, CurrencyUnit::Msat, None, work_dir, _kv_store.clone())
+                .await?;
+            #[cfg(feature = "prometheus")]
+            let litd_sat = MetricsMintPayment::new(litd_sat);
+
+            mint_builder = configure_backend_for_unit(
+                settings,
+                mint_builder,
+                CurrencyUnit::Sat,
+                mint_melt_limits,
+                Arc::new(litd_sat),
+            )
+            .await?;
+
+            // Register USD on litd (Taproot Assets); initially reuse client, TA calls added in cdk-litd later
+            let litd_usd = litd_settings
+                .setup(settings, CurrencyUnit::Msat, None, work_dir, _kv_store)
+                .await?;
+            #[cfg(feature = "prometheus")]
+            let litd_usd = MetricsMintPayment::new(litd_usd);
+
+            mint_builder = configure_backend_for_unit(
+                settings,
+                mint_builder,
+                CurrencyUnit::Usd,
+                mint_melt_limits,
+                Arc::new(litd_usd),
             )
             .await?;
         }
@@ -967,6 +1008,19 @@ async fn start_services_with_shutdown(
             );
         }
     }
+    // Persist assets config from settings if present (on boot)
+    {
+        let assets_cfg = cdk::mint::AssetsConfig {
+            usd_group_ids: settings.assets.usd_group_ids.clone(),
+        };
+        if !assets_cfg.usd_group_ids.is_empty() {
+            // Best-effort: ignore error to avoid blocking startup
+            if let Err(e) = mint.set_assets_config(assets_cfg).await {
+                tracing::warn!("Failed to persist assets config: {}", e);
+            }
+        }
+    }
+
     // Create a broadcast channel to share shutdown signal between services
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
@@ -1171,11 +1225,23 @@ pub async fn run_mintd_with_shutdown(
 
     let config_mint_info = mint_builder.current_mint_info();
 
+    tracing::info!("assets.usd_group_ids = {:?}", settings.assets.usd_group_ids);
+
     let mint = build_mint(settings, keystore, mint_builder).await?;
 
     tracing::debug!("Mint built from builder.");
 
     let mint = Arc::new(mint);
+
+    // Ensure (force) a USD keyset if USD assets are configured
+    if !settings.assets.usd_group_ids.is_empty() {
+        let fee_ppk = settings.info.input_fee_ppk.unwrap_or(0);
+        tracing::info!("Attempting USD rotate_keyset with fee_ppk={}", fee_ppk);
+        match mint.rotate_keyset(CurrencyUnit::Usd, 32, fee_ppk).await {
+            Ok(_) => tracing::info!("Ensured USD keyset is present (assets.usd_group_ids configured)"),
+            Err(e) => tracing::warn!("Failed to ensure USD keyset: {}", e),
+        }
+    }
 
     // Checks the status of all pending melt quotes
     // Pending melt quotes where the payment has gone through inputs are burnt

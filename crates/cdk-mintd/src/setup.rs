@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use bip39::rand::{thread_rng, Rng};
 use cdk::cdk_database::MintKVStore;
 use cdk::cdk_payment::MintPayment;
+#[allow(unused_imports)]
+use cdk_litd::Litd as _LitdLink; // ensure crate link
 use cdk::nuts::CurrencyUnit;
 #[cfg(any(
     feature = "lnbits",
@@ -136,6 +138,39 @@ impl LnBackendSetup for config::Lnd {
         .await?;
 
         Ok(lnd)
+    }
+}
+
+// litd backend
+#[async_trait]
+impl LnBackendSetup for config::Litd {
+    async fn setup(
+        &self,
+        _settings: &Settings,
+        _unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        _work_dir: &Path,
+        kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
+    ) -> anyhow::Result<cdk_litd::Litd> {
+        let fee_reserve = FeeReserve {
+            min_fee_reserve: self.reserve_fee_min,
+            percent_fee_reserve: self.fee_percent,
+        };
+
+        let client = cdk_litd::Litd::new(
+            self.address.clone(),
+            self.cert_file.clone(),
+            self.lnd_macaroon_file.clone(),
+            self.tapd_macaroon_file.clone(),
+            fee_reserve,
+            kv_store.expect("litd needs kv store"),
+            // Pass configured USD group ids into the backend for allowlist enforcement
+            _settings.assets.usd_group_ids.clone(),
+            self.tls_domain.clone(),
+        )
+        .await?;
+
+        Ok(client)
     }
 }
 

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bitcoin::bip32::DerivationPath;
+use bitcoin::bip32::{ChildNumber, DerivationPath};
 use cdk_common::database::{DynMintDatabase, MintKeysDatabase};
 use cdk_common::error::Error;
 use cdk_common::nut04::MintMethodOptions;
@@ -297,6 +297,24 @@ impl MintBuilder {
         self.payment_processors.insert(key, payment_processor);
         Ok(())
     }
+
+    /// Ensure a unit is present in supported units so keysets are derived even without a backend
+    pub fn with_supported_unit(mut self, unit: CurrencyUnit) -> Self {
+        if !self.supported_units.contains_key(&unit) {
+            // default input fee ppk 0 and max order 32 (consistent with add_payment_processor)
+            self.supported_units.insert(unit.clone(), (0, 32));
+        }
+        // Provide a default derivation path for USD to avoid UnsupportedUnit at signatory
+        if unit == CurrencyUnit::Usd && !self.custom_paths.contains_key(&unit) {
+            let path = DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(0).expect("valid"),
+                ChildNumber::from_hardened_idx(2).expect("valid"),
+                ChildNumber::from_hardened_idx(0).expect("valid"),
+            ]);
+            self.custom_paths.insert(unit.clone(), path);
+        }
+        self
+    }
     /// Sets the input fee ppk for a given unit
     ///
     /// The unit **MUST** already have been added with a ln backend
@@ -346,7 +364,7 @@ impl MintBuilder {
             keystore,
             seed,
             self.supported_units.clone(),
-            HashMap::new(),
+            self.custom_paths.clone(),
         )
         .await?;
 

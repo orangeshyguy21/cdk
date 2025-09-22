@@ -260,10 +260,21 @@ impl Mint {
                         return Err(Error::InvoiceDescriptionUnsupported);
                     }
 
+                    // Attempt to include an asset group id for USD quotes
+                    let asset_group_id = if unit == CurrencyUnit::Usd {
+                        match self.assets_config().await? {
+                            Some(cfg) => cfg.usd_group_ids.first().cloned(),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+
                     let bolt11_options = Bolt11IncomingPaymentOptions {
                         description,
                         amount: bolt11_request.amount,
                         unix_expiry: Some(quote_expiry),
+                        asset_group_id,
                     };
 
                     IncomingPaymentOptions::Bolt11(bolt11_options)

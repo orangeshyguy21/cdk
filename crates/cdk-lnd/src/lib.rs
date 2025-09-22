@@ -126,6 +126,12 @@ impl Lnd {
         })
     }
 
+    /// Inspect a BOLT11 invoice and return a best-effort detected asset group id (if any)
+    fn detect_asset_group_id_from_invoice(&self, _invoice: &Bolt11Invoice) -> Option<String> {
+        // Placeholder: real implementation would use LND/Taproot Assets metadata or custom TLV decoding
+        None
+    }
+
     /// Get last add and settle indices from KV store
     #[instrument(skip_all)]
     async fn get_last_indices(&self) -> Result<(Option<u64>, Option<u64>), Error> {
@@ -350,6 +356,8 @@ impl MintPayment for Lnd {
     ) -> Result<PaymentQuoteResponse, Self::Err> {
         match options {
             OutgoingPaymentOptions::Bolt11(bolt11_options) => {
+                // Optional asset id detection for melt validation/scoping
+                let _maybe_group_id = self.detect_asset_group_id_from_invoice(&bolt11_options.bolt11);
                 let amount_msat = match bolt11_options.melt_options {
                     Some(amount) => amount.amount_msat(),
                     None => bolt11_options
@@ -595,6 +603,9 @@ impl MintPayment for Lnd {
                 let unix_expiry = bolt11_options.unix_expiry;
 
                 let amount_msat = to_unit(amount, unit, &CurrencyUnit::Msat)?;
+
+                // Note: bolt11_options.asset_group_id may be used in the future to bind the invoice to a specific TA group id.
+                let _maybe_group_id = bolt11_options.asset_group_id.clone();
 
                 let invoice_request = lnrpc::Invoice {
                     value_msat: u64::from(amount_msat) as i64,

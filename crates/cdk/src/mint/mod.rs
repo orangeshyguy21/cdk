@@ -54,6 +54,7 @@ const CDK_MINT_PRIMARY_NAMESPACE: &str = "cdk_mint";
 const CDK_MINT_CONFIG_SECONDARY_NAMESPACE: &str = "config";
 const CDK_MINT_CONFIG_KV_KEY: &str = "mint_info";
 const CDK_MINT_QUOTE_TTL_KV_KEY: &str = "quote_ttl";
+const CDK_MINT_ASSETS_KV_KEY: &str = "assets";
 
 /// Cashu Mint
 #[derive(Clone)]
@@ -1056,6 +1057,48 @@ impl Mint {
 
         Ok(total_redeemed)
     }
+
+    /// Assets configuration stored in KV
+    pub async fn assets_config(&self) -> Result<Option<AssetsConfig>, Error> {
+        let maybe_bytes = self
+            .localstore
+            .kv_read(
+                CDK_MINT_PRIMARY_NAMESPACE,
+                CDK_MINT_CONFIG_SECONDARY_NAMESPACE,
+                CDK_MINT_ASSETS_KV_KEY,
+            )
+            .await?;
+
+        if let Some(bytes) = maybe_bytes {
+            let assets: AssetsConfig = serde_json::from_slice(&bytes)?;
+            Ok(Some(assets))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set assets configuration in KV
+    pub async fn set_assets_config(&self, assets: AssetsConfig) -> Result<(), Error> {
+        let bytes = serde_json::to_vec(&assets)?;
+        let mut tx = self.localstore.begin_transaction().await?;
+        tx.kv_write(
+            CDK_MINT_PRIMARY_NAMESPACE,
+            CDK_MINT_CONFIG_SECONDARY_NAMESPACE,
+            CDK_MINT_ASSETS_KV_KEY,
+            &bytes,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// Assets configuration for the mint
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct AssetsConfig {
+    /// Allowed Taproot Asset group ids backing USD
+    #[serde(default)]
+    pub usd_group_ids: Vec<String>,
 }
 
 #[cfg(test)]

@@ -160,6 +160,8 @@ pub struct Bolt11IncomingPaymentOptions {
     pub amount: Amount,
     /// Optional expiry time as Unix timestamp in seconds
     pub unix_expiry: Option<u64>,
+    /// Optional Taproot Asset group id to bind this invoice to (for USD, etc.)
+    pub asset_group_id: Option<String>,
 }
 
 /// Options for creating a BOLT12 incoming payment request

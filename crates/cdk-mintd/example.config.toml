@@ -85,8 +85,8 @@ max_connections = 20
 connection_timeout_seconds = 10
 
 [ln]
-# Required ln backend `cln`, `lnd`, `fakewallet`, 'lnbits', 'ldknode'
-ln_backend = "fakewallet"
+# Required ln backend `cln`, `lnd`, `fakewallet`, 'lnbits', 'ldknode', 'litd'
+ln_backend = "litd"
 # min_mint=1
 # max_mint=500000
 # min_melt=1
@@ -103,10 +103,15 @@ reserve_fee_min = 4
 # lnbits_api = ""
 # Note: Only LNBits v1 API is supported (websocket-based)
 
-# [lnd]
-# address = "https://domain:port"
-# macaroon_file = ""
+[litd]
+# gRPC address of litd
+# address = "https://domain:8443"
+# TLS cert and macaroon files
 # cert_file = ""
+# Separate macaroons for Lightning vs Taproot Assets
+# lnd_macaroon_file  = "/path/to/lnd/admin.macaroon"
+# tapd_macaroon_file = "/path/to/tapd/admin.macaroon"
+# Lightning fee policy
 # fee_percent=0.04
 # reserve_fee_min=4
 

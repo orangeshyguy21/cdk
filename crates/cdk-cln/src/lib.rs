@@ -538,6 +538,7 @@ impl MintPayment for Cln {
                 description,
                 amount,
                 unix_expiry,
+                ..
             }) => {
                 let time_now = unix_time();
 

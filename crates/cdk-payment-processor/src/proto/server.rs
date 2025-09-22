@@ -198,6 +198,7 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     description: opts.description,
                     amount: opts.amount.into(),
                     unix_expiry: opts.unix_expiry,
+                    asset_group_id: None,
                 })
             }
             incoming_payment_options::Options::Bolt12(opts) => IncomingPaymentOptions::Bolt12(

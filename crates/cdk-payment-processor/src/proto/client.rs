@@ -126,6 +126,7 @@ impl MintPayment for PaymentProcessorClient {
                         description: opts.description,
                         amount: opts.amount.into(),
                         unix_expiry: opts.unix_expiry,
+                        // No transport for asset_group_id in proto yet
                     },
                 )),
             },

@@ -136,6 +136,8 @@ pub enum LnBackend {
     Lnd,
     #[cfg(feature = "ldk-node")]
     LdkNode,
+    /// Lightning Terminal (litd) backend (BTC + Taproot Assets)
+    Litd,
     #[cfg(feature = "grpc-processor")]
     GrpcProcessor,
 }
@@ -155,6 +157,7 @@ impl std::str::FromStr for LnBackend {
             "lnd" => Ok(LnBackend::Lnd),
             #[cfg(feature = "ldk-node")]
             "ldk-node" | "ldknode" => Ok(LnBackend::LdkNode),
+            "litd" => Ok(LnBackend::Litd),
             #[cfg(feature = "grpc-processor")]
             "grpcprocessor" => Ok(LnBackend::GrpcProcessor),
             _ => Err(format!("Unknown Lightning backend: {s}")),
@@ -213,6 +216,20 @@ pub struct Lnd {
     pub macaroon_file: PathBuf,
     pub fee_percent: f32,
     pub reserve_fee_min: Amount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Litd {
+    pub address: String,
+    pub cert_file: PathBuf,
+    /// Macaroon used for LND LightningService calls (SAT payments)
+    pub lnd_macaroon_file: PathBuf,
+    /// Macaroon used for Taproot Assets and TaprootAssetChannels (USD over LN)
+    pub tapd_macaroon_file: PathBuf,
+    pub fee_percent: f32,
+    pub reserve_fee_min: Amount,
+    /// Optional TLS domain override when certificate CN/SAN doesn't match host
+    pub tls_domain: Option<String>,
 }
 
 #[cfg(feature = "ldk-node")]
@@ -469,12 +486,16 @@ pub struct Settings {
     pub info: Info,
     pub mint_info: MintInfo,
     pub ln: Ln,
+    /// Optional assets configuration
+    #[serde(default)]
+    pub assets: Assets,
     #[cfg(feature = "cln")]
     pub cln: Option<Cln>,
     #[cfg(feature = "lnbits")]
     pub lnbits: Option<LNbits>,
     #[cfg(feature = "lnd")]
     pub lnd: Option<Lnd>,
+    pub litd: Option<Litd>,
     #[cfg(feature = "ldk-node")]
     pub ldk_node: Option<LdkNode>,
     #[cfg(feature = "fakewallet")]
@@ -496,6 +517,14 @@ pub struct Prometheus {
     pub enabled: bool,
     pub address: Option<String>,
     pub port: Option<u16>,
+}
+
+/// Assets configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Assets {
+    /// Allowed Taproot Asset group ids that back USD
+    #[serde(default)]
+    pub usd_group_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -613,6 +642,9 @@ impl Settings {
                     settings.grpc_processor.is_some(),
                     "GRPC backend requires a valid config."
                 )
+            }
+            LnBackend::Litd => {
+                assert!(settings.litd.is_some(), "litd backend requires a valid config.");
             }
         }
 
