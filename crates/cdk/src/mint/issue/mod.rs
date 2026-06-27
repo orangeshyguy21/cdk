@@ -207,6 +207,8 @@ impl Mint {
         METRICS.inc_in_flight_requests("get_mint_quote");
 
         let result = async {
+            self.check_not_expired().await?;
+
             // Use the new getters for cleaner code
             let unit = mint_quote_request.unit();
             let amount = mint_quote_request.amount();
@@ -652,6 +654,8 @@ impl Mint {
         METRICS.inc_in_flight_requests("process_mint_request");
 
         let result = async {
+            self.check_not_expired().await?;
+
             // Phase 1: Validate input structure
             input.validate()?;
 

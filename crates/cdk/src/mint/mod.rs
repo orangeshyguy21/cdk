@@ -27,6 +27,7 @@ use crate::nuts::*;
 use crate::{Amount, OidcClient};
 
 pub(crate) mod auth;
+pub mod autorotate;
 mod builder;
 mod check_spendable;
 mod issue;
@@ -40,6 +41,7 @@ mod subscription;
 mod swap;
 mod verification;
 
+pub use autorotate::{AutoPruneConfig, AutorotateConfig};
 pub use builder::{KeysetRotation, MintBuilder, MintMeltLimits, UnitConfig};
 pub use cdk_common::mint::{MeltQuote, MintKeySetInfo, MintQuote};
 pub use cdk_common::mint_quote::{MintQuoteRequest, MintQuoteResponse};
@@ -62,6 +64,11 @@ pub struct Mint {
     signatory: Arc<dyn Signatory + Send + Sync>,
     /// Mint Storage backend
     localstore: DynMintDatabase,
+    /// Direct handle to the keys-database writer; unset when the signatory is
+    /// remote, in which case autorotate cannot stamp `final_expiry` on
+    /// deactivated keysets.
+    keys_localstore:
+        Option<Arc<dyn database::MintKeysDatabase<Err = database::Error> + Send + Sync>>,
     /// Auth Storage backend (only available with auth feature)
     auth_localstore: Option<DynMintAuthDatabase>,
     /// Payment processors for mint
@@ -92,6 +99,10 @@ struct TaskState {
     shutdown_notify: Option<Arc<Notify>>,
     /// Handle to the main supervisor task
     supervisor_handle: Option<JoinHandle<Result<(), Error>>>,
+    /// Handle to the autorotate supervisor task
+    autorotate_handle: Option<JoinHandle<()>>,
+    /// Dedicated shutdown signal for the autorotate supervisor
+    autorotate_shutdown: Option<Arc<Notify>>,
 }
 
 impl Mint {
@@ -244,11 +255,22 @@ impl Mint {
             }),
             payment_processors,
             auth_localstore,
+            keys_localstore: None,
             keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
             task_state: Arc::new(Mutex::new(TaskState::default())),
             max_inputs,
             max_outputs,
         })
+    }
+
+    /// Attach a direct handle to the keys database so autorotate can update
+    /// keyset metadata (notably `final_expiry`). Optional — autorotate will
+    /// log a warning and skip metadata updates if this is not set.
+    pub fn set_keys_localstore(
+        &mut self,
+        keys_localstore: Arc<dyn database::MintKeysDatabase<Err = database::Error> + Send + Sync>,
+    ) {
+        self.keys_localstore = Some(keys_localstore);
     }
 
     /// Start the mint's background services and operations
@@ -365,6 +387,16 @@ impl Mint {
         // Take the handles out of the state
         let shutdown_notify = task_state.shutdown_notify.take();
         let supervisor_handle = task_state.supervisor_handle.take();
+        let autorotate_shutdown = task_state.autorotate_shutdown.take();
+        let autorotate_handle = task_state.autorotate_handle.take();
+
+        // Stop the autorotate supervisor first, regardless of payment-supervisor state.
+        if let (Some(notify), Some(handle)) = (autorotate_shutdown, autorotate_handle) {
+            notify.notify_waiters();
+            if let Err(e) = handle.await {
+                tracing::error!("Autorotate supervisor task panicked: {:?}", e);
+            }
+        }
 
         // If nothing to stop, return early
         let (shutdown_notify, supervisor_handle) = match (shutdown_notify, supervisor_handle) {
@@ -544,6 +576,20 @@ impl Mint {
         };
 
         Ok(mint_info)
+    }
+
+    /// Return an error if the mint has a configured `expiry_unix_time` that
+    /// has elapsed. Used as a guard at the entry of every spending endpoint
+    /// (mint, swap, melt). `/v1/info`, `/v1/keys`, and `/v1/keysets` stay live
+    /// after expiry so wallets can still discover the state.
+    pub async fn check_not_expired(&self) -> Result<(), Error> {
+        let info = self.mint_info().await?;
+        if let Some(ts) = info.expiry_unix_time {
+            if cdk_common::util::unix_time() >= ts {
+                return Err(Error::MintExpired(ts));
+            }
+        }
+        Ok(())
     }
 
     /// Set mint info

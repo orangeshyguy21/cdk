@@ -210,6 +210,9 @@ pub enum Error {
     /// Keyset has expired
     #[error("Keyset has expired")]
     ExpiredKeyset,
+    /// Mint has reached its configured expiry; no new spending activity accepted.
+    #[error("Mint expired at {0}")]
+    MintExpired(u64),
     /// Transaction unbalanced
     #[error("Inputs: `{0}`, Outputs: `{1}`, Expected Fee: `{2}`")]
     TransactionUnbalanced(u64, u64, u64),
@@ -589,6 +592,7 @@ impl Error {
             | Self::BlindedMessageAlreadySigned
             | Self::InactiveKeyset
             | Self::ExpiredKeyset
+            | Self::MintExpired(_)
             | Self::TransactionUnbalanced(_, _, _)
             | Self::DuplicateInputs
             | Self::DuplicateOutputs
@@ -900,6 +904,10 @@ impl From<Error> for ErrorResponse {
                 code: ErrorCode::KeysetExpired,
                 detail: err.to_string(),
             },
+            Error::MintExpired(_) => ErrorResponse {
+                code: ErrorCode::MintExpired,
+                detail: err.to_string(),
+            },
             Error::AmountLessNotAllowed => ErrorResponse {
                 code: ErrorCode::AmountlessInvoiceNotSupported,
                 detail: err.to_string(),
@@ -1107,6 +1115,7 @@ impl From<ErrorResponse> for Error {
             ErrorCode::QuoteExpired => Self::ExpiredQuote(0, 0),
             ErrorCode::WitnessMissingOrInvalid => Self::SignatureMissingOrInvalid,
             ErrorCode::PubkeyRequired => Self::PubkeyRequired,
+            ErrorCode::MintExpired => Self::MintExpired(0),
             // 30xxx - Clear auth errors
             ErrorCode::ClearAuthRequired => Self::ClearAuthRequired,
             ErrorCode::ClearAuthFailed => Self::ClearAuthFailed,
@@ -1190,6 +1199,8 @@ pub enum ErrorCode {
     WitnessMissingOrInvalid,
     /// Pubkey required for mint quote (20009)
     PubkeyRequired,
+    /// Mint has expired; spending endpoints disabled (20010)
+    MintExpired,
 
     // 30xxx - Clear auth errors
     /// Endpoint requires clear auth (30001)
@@ -1252,6 +1263,7 @@ impl ErrorCode {
             20007 => Self::QuoteExpired,
             20008 => Self::WitnessMissingOrInvalid,
             20009 => Self::PubkeyRequired,
+            20010 => Self::MintExpired,
             // 30xxx - Clear auth errors
             30001 => Self::ClearAuthRequired,
             30002 => Self::ClearAuthFailed,
@@ -1301,6 +1313,7 @@ impl ErrorCode {
             Self::QuoteExpired => 20007,
             Self::WitnessMissingOrInvalid => 20008,
             Self::PubkeyRequired => 20009,
+            Self::MintExpired => 20010,
             // 30xxx - Clear auth errors
             Self::ClearAuthRequired => 30001,
             Self::ClearAuthFailed => 30002,

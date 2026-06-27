@@ -127,6 +127,19 @@ where
 
         Ok(())
     }
+
+    async fn set_keyset_final_expiry(
+        &mut self,
+        id: &Id,
+        final_expiry: Option<u64>,
+    ) -> Result<(), Error> {
+        query(r#"UPDATE keyset SET valid_to = :valid_to WHERE id = :id"#)?
+            .bind("valid_to", final_expiry.map(|v| v as i64))
+            .bind("id", id.to_string())
+            .execute(&self.inner)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]

@@ -125,10 +125,12 @@ where
 
                     query(
                         r#"
-                        INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed)
-                        VALUES (:keyset_id, :amount, 0)
+                        INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed, issued_count)
+                        VALUES (:keyset_id, :amount, 0, 1)
                         ON CONFLICT (keyset_id)
-                        DO UPDATE SET total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued
+                        DO UPDATE SET
+                            total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued,
+                            issued_count = keyset_amounts.issued_count + EXCLUDED.issued_count
                         "#,
                     )?
                     .bind("amount", u64::from(signature.amount) as i64)
@@ -165,10 +167,12 @@ where
 
                             query(
                                 r#"
-                                INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed)
-                                VALUES (:keyset_id, :amount, 0)
+                                INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed, issued_count)
+                                VALUES (:keyset_id, :amount, 0, 1)
                                 ON CONFLICT (keyset_id)
-                                DO UPDATE SET total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued
+                                DO UPDATE SET
+                                    total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued,
+                                    issued_count = keyset_amounts.issued_count + EXCLUDED.issued_count
                                 "#,
                             )?
                             .bind("amount", u64::from(signature.amount) as i64)
@@ -248,6 +252,22 @@ where
             .iter()
             .map(|y| blinded_signatures.remove(y))
             .collect())
+    }
+
+    async fn delete_blind_signatures_by_keyset_id(
+        &mut self,
+        keyset_id: &Id,
+        limit: Option<usize>,
+    ) -> Result<usize, Self::Err> {
+        super::delete_by_keyset_with_limit(
+            self,
+            "blind_signature",
+            "blinded_message",
+            "keyset_id",
+            &keyset_id.to_string(),
+            limit,
+        )
+        .await
     }
 }
 
@@ -392,6 +412,34 @@ where
         .into_iter()
         .map(sql_row_to_hashmap_amount)
         .collect()
+    }
+
+    async fn get_keyset_counts(&self, keyset_id: &Id) -> Result<(u64, u64), Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let row = query(
+            r#"
+            SELECT issued_count, redeemed_count
+            FROM keyset_amounts
+            WHERE keyset_id = :keyset_id
+            "#,
+        )?
+        .bind("keyset_id", keyset_id.to_string())
+        .fetch_one(&*conn)
+        .await?;
+
+        Ok(match row {
+            Some(row) => {
+                unpack_into!(let (issued_count, redeemed_count) = row);
+                let issued: u64 = column_as_number!(issued_count);
+                let redeemed: u64 = column_as_number!(redeemed_count);
+                (issued, redeemed)
+            }
+            None => (0, 0),
+        })
     }
 
     async fn get_blinded_secrets_by_operation_id(

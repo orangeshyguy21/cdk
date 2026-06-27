@@ -109,6 +109,11 @@ pub struct MintInfo {
     /// terms of url service of the mint
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tos_url: Option<String>,
+    /// Unix timestamp at which the mint stops accepting new mint/swap/melt
+    /// activity. `/v1/info` continues to be served after this point so wallets
+    /// can discover the expiry. `None` means the mint has no scheduled expiry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiry_unix_time: Option<u64>,
 }
 
 impl MintInfo {
@@ -220,6 +225,22 @@ impl MintInfo {
         Self {
             tos_url: Some(tos_url.into()),
             ..self
+        }
+    }
+
+    /// Set expiry timestamp (unix seconds).
+    pub fn expiry_unix_time(self, expiry_unix_time: u64) -> Self {
+        Self {
+            expiry_unix_time: Some(expiry_unix_time),
+            ..self
+        }
+    }
+
+    /// True if a mint expiry is configured and we are past it.
+    pub fn is_expired(&self) -> bool {
+        match self.expiry_unix_time {
+            Some(ts) => crate::util::unix_time() >= ts,
+            None => false,
         }
     }
 
@@ -725,5 +746,26 @@ mod tests {
         assert!(!parsed["nuts"]["15"].is_null());
         assert!(parsed["nuts"]["15"]["methods"].is_array());
         assert_eq!(parsed["nuts"]["15"]["methods"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_expiry_unix_time_serialization_and_is_expired() {
+        let info_none = MintInfo::default();
+        assert!(!info_none.is_expired());
+        let json = serde_json::to_string(&info_none).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Field is omitted when None (skip_serializing_if).
+        assert!(parsed["expiry_unix_time"].is_null());
+
+        let future = crate::util::unix_time() + 3600;
+        let info_future = MintInfo::default().expiry_unix_time(future);
+        assert!(!info_future.is_expired());
+        let json = serde_json::to_string(&info_future).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["expiry_unix_time"].as_u64(), Some(future));
+
+        let past = crate::util::unix_time().saturating_sub(3600);
+        let info_past = MintInfo::default().expiry_unix_time(past);
+        assert!(info_past.is_expired());
     }
 }

@@ -242,6 +242,10 @@ pub fn create_fake_wallet_settings(
         mint_management_rpc: None,
         auth: None,
         prometheus: Some(Default::default()),
+        autorotate: cdk_mintd::config::Autorotate {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }
 
@@ -295,6 +299,10 @@ pub fn create_cln_settings(
         mint_management_rpc: None,
         auth: None,
         prometheus: Some(Default::default()),
+        autorotate: cdk_mintd::config::Autorotate {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }
 
@@ -346,5 +354,9 @@ pub fn create_lnd_settings(
         mint_management_rpc: None,
         auth: None,
         prometheus: Some(Default::default()),
+        autorotate: cdk_mintd::config::Autorotate {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }

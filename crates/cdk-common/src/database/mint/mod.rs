@@ -131,6 +131,15 @@ pub trait KeysDatabaseTransaction<'a, Error>: DbTransactionFinalizer<Err = Error
 
     /// Add [`MintKeySetInfo`]
     async fn add_keyset_info(&mut self, keyset: MintKeySetInfo) -> Result<(), Error>;
+
+    /// Set the `final_expiry` (a.k.a. `valid_to`) on an existing keyset. Used
+    /// by autorotate to stamp a soft-delete deadline on a keyset that has just
+    /// been deactivated.
+    async fn set_keyset_final_expiry(
+        &mut self,
+        id: &Id,
+        final_expiry: Option<u64>,
+    ) -> Result<(), Error>;
 }
 
 /// Mint Keys Database trait
@@ -420,6 +429,15 @@ pub trait ProofsTransaction {
         &mut self,
         operation_id: &uuid::Uuid,
     ) -> Result<Vec<PublicKey>, Self::Err>;
+
+    /// Delete proofs belonging to a soft-deleted keyset. Returns the number of
+    /// rows removed. If `limit` is `Some(n)`, deletes at most `n` rows so the
+    /// caller can resume on a later tick.
+    async fn delete_proofs_by_keyset_id(
+        &mut self,
+        keyset_id: &Id,
+        limit: Option<usize>,
+    ) -> Result<usize, Self::Err>;
 }
 
 /// Mint Proof Database trait
@@ -473,6 +491,15 @@ pub trait SignaturesTransaction {
         &mut self,
         blinded_messages: &[PublicKey],
     ) -> Result<Vec<Option<BlindSignature>>, Self::Err>;
+
+    /// Delete blind signatures belonging to a soft-deleted keyset. Returns the
+    /// number of rows removed. If `limit` is `Some(n)`, deletes at most `n`
+    /// rows so the caller can resume on a later tick.
+    async fn delete_blind_signatures_by_keyset_id(
+        &mut self,
+        keyset_id: &Id,
+        limit: Option<usize>,
+    ) -> Result<usize, Self::Err>;
 }
 
 #[async_trait]
@@ -501,6 +528,11 @@ pub trait SignaturesDatabase {
 
     /// Get total amount issued by keyset id
     async fn get_total_issued(&self) -> Result<HashMap<Id, Amount>, Self::Err>;
+
+    /// Get the per-keyset transaction counts `(issued_count, redeemed_count)`
+    /// used by autorotate's volume trigger. Returns `(0, 0)` if the keyset has
+    /// no recorded activity yet.
+    async fn get_keyset_counts(&self, keyset_id: &Id) -> Result<(u64, u64), Self::Err>;
 
     /// Get blinded secrets (B values) by operation id
     async fn get_blinded_secrets_by_operation_id(

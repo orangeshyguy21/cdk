@@ -214,13 +214,15 @@ where
         if new_state == State::Spent {
             query(
                     r#"
-                    INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed)
-                    SELECT keyset_id, 0, COALESCE(SUM(amount), 0)
+                    INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed, redeemed_count)
+                    SELECT keyset_id, 0, COALESCE(SUM(amount), 0), COUNT(*)
                     FROM proof
                     WHERE y IN (:ys)
                     GROUP BY keyset_id
                     ON CONFLICT (keyset_id)
-                    DO UPDATE SET total_redeemed = keyset_amounts.total_redeemed + EXCLUDED.total_redeemed
+                    DO UPDATE SET
+                        total_redeemed = keyset_amounts.total_redeemed + EXCLUDED.total_redeemed,
+                        redeemed_count = keyset_amounts.redeemed_count + EXCLUDED.redeemed_count
                     "#,
                 )?
                 .bind_vec("ys", ys.iter().map(|y| y.to_bytes().to_vec()).collect())?
@@ -396,6 +398,22 @@ where
 
         let state = first_state.unwrap_or(State::Unspent);
         Ok(ProofsWithState::new(proofs, state).into())
+    }
+
+    async fn delete_proofs_by_keyset_id(
+        &mut self,
+        keyset_id: &Id,
+        limit: Option<usize>,
+    ) -> Result<usize, Self::Err> {
+        super::delete_by_keyset_with_limit(
+            self,
+            "proof",
+            "y",
+            "keyset_id",
+            &keyset_id.to_string(),
+            limit,
+        )
+        .await
     }
 }
 

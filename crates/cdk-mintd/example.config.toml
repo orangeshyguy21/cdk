@@ -62,6 +62,10 @@ tti = 60
 # contact_nostr_public_key = ""
 # tos_url = "https://example.com/terms-of-service"
 
+# Optional mint expiry (unix seconds). After this, mint/swap/melt return MintExpired; /v1/info still served.
+# Example value below = 60 days from 2026-05-23 ("Heat Death" preset). Omit for indefinite life ("Standard").
+# expiry_unix_time = 1769014800
+
 
 [database]
 # Database engine (sqlite/postgres) defaults to sqlite
@@ -240,3 +244,18 @@ max_delay_time = 3
 max_inputs = 1000
 # Maximum number of outputs allowed per transaction (mint/swap/melt)
 max_outputs = 1000
+
+# Auto-rotate the active keyset on whichever trigger fires first; optional auto-prune of expired keysets.
+# Code default: enabled=false (safe upgrade). This file enables it with "Mint Standard" defaults (180d / 100k tokens / 360d grace).
+# "Heat Death" preset: pair with mint_info.expiry_unix_time and set rotation_by_time_seconds=5184000, grace_period_seconds=2592000.
+[autorotate]
+enabled = true
+# check_interval_seconds = 3600
+# rotation_by_time_seconds = 15552000   # 180 days; null disables the time trigger
+# rotation_by_token_count = 100000      # blind sigs issued + proofs spent per keyset (bounds DB rows, not txs); null disables
+# grace_period_seconds = 31104000       # 360 days for wallets to redeem before the keyset is prune-eligible
+
+# Destructive: deletes blind_signature and proof rows for inactive keysets past grace_period_seconds. Ecash from pruned keysets is unredeemable.
+[autorotate.prune]
+enabled = false
+# batch_size = 10000   # rows per table per keyset per tick; 0 = uncapped

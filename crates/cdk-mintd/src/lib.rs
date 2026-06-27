@@ -15,7 +15,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use bip39::Mnemonic;
 use cdk::cdk_database::{self, KVStore, MintDatabase, MintKeysDatabase};
-use cdk::mint::{Mint, MintBuilder, MintMeltLimits};
+use cdk::mint::{AutoPruneConfig, AutorotateConfig, Mint, MintBuilder, MintMeltLimits};
 use cdk::nuts::nut00::KnownMethod;
 #[cfg(any(
     feature = "cln",
@@ -462,6 +462,10 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
         if !tos_url.is_empty() {
             builder = builder.with_tos_url(tos_url.to_string());
         }
+    }
+
+    if let Some(expiry_unix_time) = settings.mint_info.expiry_unix_time {
+        builder = builder.with_expiry_unix_time(expiry_unix_time);
     }
 
     builder = builder.with_keyset_v2(settings.info.use_keyset_v2);
@@ -1277,6 +1281,26 @@ async fn start_services_with_shutdown(
     };
 
     mint.start().await?;
+
+    {
+        let cfg = &settings.autorotate;
+        let autorotate_cfg = AutorotateConfig {
+            enabled: cfg.enabled,
+            check_interval: std::time::Duration::from_secs(cfg.check_interval_seconds),
+            rotation_by_time_seconds: cfg.rotation_by_time_seconds,
+            rotation_by_token_count: cfg.rotation_by_token_count,
+            grace_period_seconds: cfg.grace_period_seconds,
+            prune: AutoPruneConfig {
+                enabled: cfg.prune.enabled,
+                batch_size: if cfg.prune.batch_size == 0 {
+                    None
+                } else {
+                    Some(cfg.prune.batch_size)
+                },
+            },
+        };
+        mint.start_autorotate(autorotate_cfg).await?;
+    }
 
     let socket_addr = SocketAddr::from_str(&format!("{listen_addr}:{listen_port}"))?;
 

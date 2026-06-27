@@ -22,6 +22,8 @@ impl Mint {
         #[cfg(feature = "prometheus")]
         METRICS.inc_in_flight_requests("process_swap_request");
 
+        self.check_not_expired().await?;
+
         swap_request.input_amount()?;
         swap_request.output_amount()?;
 

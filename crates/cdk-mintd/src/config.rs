@@ -669,6 +669,8 @@ pub struct Settings {
     pub auth: Option<Auth>,
     #[cfg(feature = "prometheus")]
     pub prometheus: Option<Prometheus>,
+    #[serde(default)]
+    pub autorotate: Autorotate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -707,6 +709,125 @@ fn default_max_outputs() -> usize {
     1000
 }
 
+/// Automatic keyset rotation and pruning configuration.
+///
+/// Either `rotation_by_time_seconds` or `rotation_by_token_count` may be set
+/// to `null` to disable that side of the trigger. The supervisor still runs
+/// (and can prune) if both are null and `enabled = true`.
+///
+/// Defaults match the "Mint Standard" profile (180-day rotation by time,
+/// 100k token threshold, 360-day grace period). The "Heat Death" profile
+/// is documented in `example.config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Autorotate {
+    /// Master switch for the supervisor. Default `false` in code so that
+    /// upgrades cannot silently start rotating keysets; `example.config.toml`
+    /// flips it on for new mints.
+    #[serde(default = "default_autorotate_enabled")]
+    pub enabled: bool,
+    /// Interval between supervisor evaluations, in seconds. Default 3600.
+    #[serde(default = "default_check_interval_seconds")]
+    pub check_interval_seconds: u64,
+    /// Time-based trigger: rotate when the active keyset's age in seconds is
+    /// `>=` this value. Default 180 days. `null` disables the time trigger.
+    #[serde(
+        default = "default_rotation_by_time_seconds",
+        alias = "max_keyset_age_seconds"
+    )]
+    pub rotation_by_time_seconds: Option<u64>,
+    /// Token-count trigger, bounded for DB-growth control. Counts one per
+    /// ecash token this keyset has issued (each blind signature) plus one
+    /// per token of this keyset that has been spent (each proof in `SPENT`
+    /// state) — i.e. each row that accumulates in `blind_signature` and
+    /// `proof` for the keyset. A single user transaction (mint or swap)
+    /// typically moves multiple tokens (one per output denomination and per
+    /// input proof), so this is *not* a transaction count. Default 100000.
+    /// `null` disables the trigger.
+    #[serde(
+        default = "default_rotation_by_token_count",
+        alias = "rotation_by_element_count",
+        alias = "rotation_by_txcount",
+        alias = "max_keyset_volume"
+    )]
+    pub rotation_by_token_count: Option<u64>,
+    /// Grace period applied to `final_expiry` when a keyset is rotated out.
+    /// Wallets get this long to redeem old ecash before the keyset becomes
+    /// eligible for pruning. Default 360 days.
+    #[serde(
+        default = "default_grace_period_seconds",
+        alias = "inactive_grace_seconds"
+    )]
+    pub grace_period_seconds: u64,
+    /// Pruning configuration (destructive, opt-in).
+    #[serde(default)]
+    pub prune: AutoPrune,
+}
+
+impl Default for Autorotate {
+    fn default() -> Self {
+        Self {
+            enabled: default_autorotate_enabled(),
+            check_interval_seconds: default_check_interval_seconds(),
+            rotation_by_time_seconds: default_rotation_by_time_seconds(),
+            rotation_by_token_count: default_rotation_by_token_count(),
+            grace_period_seconds: default_grace_period_seconds(),
+            prune: AutoPrune::default(),
+        }
+    }
+}
+
+/// Pruning configuration for soft-deleted keysets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPrune {
+    /// When `true`, the supervisor removes proofs and blind signatures for
+    /// keysets whose `final_expiry` has elapsed. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-tick cap on rows removed per table per keyset; `0` means no cap.
+    /// Default 10000.
+    #[serde(default = "default_prune_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for AutoPrune {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: default_prune_batch_size(),
+        }
+    }
+}
+
+const ONE_DAY_SECS: u64 = 24 * 60 * 60;
+/// "Mint Standard" defaults: keysets rotate every 180 days, redeemable for an
+/// additional 360 days before prune is eligible.
+const STANDARD_ROTATION_BY_TIME_SECS: u64 = 180 * ONE_DAY_SECS;
+const STANDARD_GRACE_PERIOD_SECS: u64 = 360 * ONE_DAY_SECS;
+
+fn default_autorotate_enabled() -> bool {
+    false
+}
+
+fn default_check_interval_seconds() -> u64 {
+    3600
+}
+
+fn default_rotation_by_time_seconds() -> Option<u64> {
+    Some(STANDARD_ROTATION_BY_TIME_SECS)
+}
+
+fn default_rotation_by_token_count() -> Option<u64> {
+    Some(100_000)
+}
+
+fn default_grace_period_seconds() -> u64 {
+    STANDARD_GRACE_PERIOD_SECS
+}
+
+fn default_prune_batch_size() -> usize {
+    10_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MintInfo {
     /// name of the mint and should be recognizable
@@ -727,6 +848,11 @@ pub struct MintInfo {
     pub contact_email: Option<String>,
     /// URL to the terms of service
     pub tos_url: Option<String>,
+    /// Optional mint-level expiry timestamp (unix seconds). After this time
+    /// the mint refuses mint/swap/melt requests with a `MintExpired` error
+    /// while `/v1/info`, `/v1/keys`, and `/v1/keysets` remain available.
+    /// Published in `/v1/info` as `expiry_unix_time`.
+    pub expiry_unix_time: Option<u64>,
 }
 
 #[cfg(feature = "management-rpc")]

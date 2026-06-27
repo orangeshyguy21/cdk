@@ -229,6 +229,14 @@ impl MintBuilder {
         self
     }
 
+    /// Set the optional mint-level expiry (unix seconds). After this time the
+    /// mint will reject mint/swap/melt with `MintExpired` while continuing to
+    /// serve `/v1/info`, `/v1/keys`, and `/v1/keysets`.
+    pub fn with_expiry_unix_time(mut self, expiry_unix_time: u64) -> Self {
+        self.mint_info.expiry_unix_time = Some(expiry_unix_time);
+        self
+    }
+
     /// Set description
     pub fn with_description(mut self, description: String) -> Self {
         self.mint_info.description = Some(description);
@@ -643,7 +651,7 @@ impl MintBuilder {
         seed: &[u8],
     ) -> Result<Mint, Error> {
         let in_memory_signatory = cdk_signatory::db_signatory::DbSignatory::new(
-            keystore,
+            Arc::clone(&keystore),
             seed,
             self.supported_units.clone(),
             self.custom_paths.clone(),
@@ -654,7 +662,11 @@ impl MintBuilder {
             in_memory_signatory,
         )));
 
-        self.build_with_signatory(signatory).await
+        let mut mint = self.build_with_signatory(signatory).await?;
+        // Attach the keys store so autorotate can update keyset metadata
+        // (notably `final_expiry`) directly.
+        mint.set_keys_localstore(keystore);
+        Ok(mint)
     }
 }
 

@@ -1,3 +1,4 @@
+use cdk_common::util::unix_time;
 use cdk_signatory::signatory::RotateKeyArguments;
 use tracing::instrument;
 
@@ -6,6 +7,10 @@ use super::{
 };
 use crate::Error;
 
+fn keyset_is_live(final_expiry: Option<u64>, now: u64) -> bool {
+    final_expiry.is_none_or(|expiry| expiry >= now)
+}
+
 mod auth;
 
 impl Mint {
@@ -13,10 +18,11 @@ impl Mint {
     /// clients
     #[instrument(skip(self))]
     pub fn keyset_pubkeys(&self, keyset_id: &Id) -> Result<KeysResponse, Error> {
+        let now = unix_time();
         self.keysets
             .load()
             .iter()
-            .find(|keyset| &keyset.id == keyset_id)
+            .find(|keyset| &keyset.id == keyset_id && keyset_is_live(keyset.final_expiry, now))
             .ok_or(Error::UnknownKeySet)
             .map(|key| KeysResponse {
                 keysets: vec![key.into()],
@@ -27,12 +33,17 @@ impl Mint {
     /// clients
     #[instrument(skip_all)]
     pub fn pubkeys(&self) -> KeysResponse {
+        let now = unix_time();
         KeysResponse {
             keysets: self
                 .keysets
                 .load()
                 .iter()
-                .filter(|keyset| keyset.active && keyset.unit != CurrencyUnit::Auth)
+                .filter(|keyset| {
+                    keyset.active
+                        && keyset.unit != CurrencyUnit::Auth
+                        && keyset_is_live(keyset.final_expiry, now)
+                })
                 .map(|key| key.into())
                 .collect::<Vec<_>>(),
         }
@@ -41,12 +52,13 @@ impl Mint {
     /// Return a list of all supported keysets
     #[instrument(skip_all)]
     pub fn keysets(&self) -> KeysetResponse {
+        let now = unix_time();
         KeysetResponse {
             keysets: self
                 .keysets
                 .load()
                 .iter()
-                .filter(|k| k.unit != CurrencyUnit::Auth)
+                .filter(|k| k.unit != CurrencyUnit::Auth && keyset_is_live(k.final_expiry, now))
                 .map(|k| KeySetInfo {
                     id: k.id,
                     unit: k.unit.clone(),

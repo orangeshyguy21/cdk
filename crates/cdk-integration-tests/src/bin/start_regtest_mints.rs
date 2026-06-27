@@ -321,6 +321,10 @@ fn create_ldk_settings(
         mint_management_rpc: None,
         prometheus: None,
         auth: None,
+        autorotate: cdk_mintd::config::Autorotate {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }
 

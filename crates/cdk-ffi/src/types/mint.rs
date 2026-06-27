@@ -623,6 +623,9 @@ pub struct MintInfo {
     pub time: Option<u64>,
     /// terms of url service of the mint
     pub tos_url: Option<String>,
+    /// Optional mint expiry (unix seconds). After this time the mint
+    /// rejects mint/swap/melt; `/v1/info` keeps responding.
+    pub expiry_unix_time: Option<u64>,
 }
 
 impl From<cdk::nuts::MintInfo> for MintInfo {
@@ -642,6 +645,7 @@ impl From<cdk::nuts::MintInfo> for MintInfo {
             motd: info.motd,
             time: info.time,
             tos_url: info.tos_url,
+            expiry_unix_time: info.expiry_unix_time,
         }
     }
 }
@@ -665,6 +669,7 @@ impl TryFrom<MintInfo> for cdk::nuts::MintInfo {
             motd: info.motd,
             time: info.time,
             tos_url: info.tos_url,
+            expiry_unix_time: info.expiry_unix_time,
         })
     }
 }
@@ -1089,6 +1094,7 @@ mod tests {
             motd: None,
             time: None,
             tos_url: None,
+            expiry_unix_time: None,
         };
 
         let result = cdk::nuts::MintInfo::try_from(ffi_mint_info);

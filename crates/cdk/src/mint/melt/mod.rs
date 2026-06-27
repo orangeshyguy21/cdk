@@ -283,6 +283,7 @@ impl Mint {
         &self,
         melt_quote_request: MeltQuoteRequest,
     ) -> Result<MeltQuoteCreateResponse<QuoteId>, Error> {
+        self.check_not_expired().await?;
         match melt_quote_request {
             MeltQuoteRequest::Bolt11(bolt11_request) => Ok(MeltQuoteCreateResponse::Bolt11(
                 self.get_melt_bolt11_quote_impl(&bolt11_request).await?,
@@ -760,6 +761,8 @@ impl Mint {
     /// Uses MeltSaga typestate pattern for atomic transaction handling with automatic rollback on failure.
     #[instrument(skip_all)]
     pub async fn melt(&self, melt_request: &MeltRequest<QuoteId>) -> Result<PendingMelt, Error> {
+        self.check_not_expired().await?;
+
         // Check max outputs limit (if change outputs are provided)
         if let Some(outputs) = melt_request.outputs() {
             let outputs_count = outputs.len();

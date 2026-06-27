@@ -55,6 +55,48 @@ where
     pub(crate) inner: ConnectionWithTransaction<RM::Connection, PooledResource<RM>>,
 }
 
+/// Delete rows from `table` where `keyset_id_col` matches, optionally capped
+/// to `limit` rows. `pk_col` is the primary key column used to implement the
+/// `LIMIT` via a subquery (postgres does not accept `LIMIT` on `DELETE`).
+///
+/// Caller is responsible for ensuring `table`, `pk_col`, and `keyset_id_col`
+/// are not attacker-controlled — they are interpolated into the SQL.
+pub(crate) async fn delete_by_keyset_with_limit<RM>(
+    tx: &SQLTransaction<RM>,
+    table: &str,
+    pk_col: &str,
+    keyset_id_col: &str,
+    keyset_id: &str,
+    limit: Option<usize>,
+) -> Result<usize, Error>
+where
+    RM: DatabasePool + 'static,
+{
+    use crate::stmt::query;
+    let deleted = match limit {
+        Some(n) if n > 0 => {
+            let sql = format!(
+                "DELETE FROM {table} WHERE {pk_col} IN (\
+                    SELECT {pk_col} FROM {table} WHERE {keyset_id_col} = :keyset_id LIMIT :limit\
+                )"
+            );
+            query(&sql)?
+                .bind("keyset_id", keyset_id.to_string())
+                .bind("limit", n as i64)
+                .execute(&tx.inner)
+                .await?
+        }
+        _ => {
+            let sql = format!("DELETE FROM {table} WHERE {keyset_id_col} = :keyset_id");
+            query(&sql)?
+                .bind("keyset_id", keyset_id.to_string())
+                .execute(&tx.inner)
+                .await?
+        }
+    };
+    Ok(deleted)
+}
+
 impl<RM> SQLMintDatabase<RM>
 where
     RM: DatabasePool + 'static,

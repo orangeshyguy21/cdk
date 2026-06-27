@@ -4,6 +4,7 @@
 //! This module contains all environment variable definitions and parsing logic
 //! organized by component.
 
+mod autorotate;
 mod common;
 mod database;
 mod info;
@@ -34,6 +35,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
 pub use auth::*;
+pub use autorotate::*;
 #[cfg(feature = "cln")]
 pub use cln::*;
 pub use common::*;
@@ -92,6 +94,7 @@ impl Settings {
         self.mint_info = self.mint_info.clone().from_env();
         self.ln = self.ln.clone().from_env();
         self.limits = self.limits.clone().from_env();
+        self.autorotate = self.autorotate.from_env();
 
         {
             // Check env vars for auth config even if None
