@@ -1,5 +1,10 @@
 //! CDK mint proto types
 
+/// Federation setup service, served before a mint exists
+pub mod federation_setup {
+    tonic::include_proto!("cdk_mint_federation_setup_v1");
+}
+
 /// Mint metadata administration service
 pub mod info {
     tonic::include_proto!("cdk_mint_info_v1");
@@ -27,4 +32,6 @@ pub mod wallet {
 
 mod server;
 
-pub use server::{MintMutationGuard, MintMutationGuardError, MintRPCServer};
+pub use server::{
+    FederationSetupRPCServer, MintMutationGuard, MintMutationGuardError, MintRPCServer,
+};

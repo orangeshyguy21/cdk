@@ -12,6 +12,7 @@ use tokio::time::Duration;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::Status;
 
+mod federation_setup;
 mod info;
 mod keyset;
 mod payment_method;
@@ -26,6 +27,8 @@ use crate::payment_method::payment_method_service_server::PaymentMethodServiceSe
 use crate::quote::quote_service_server::QuoteServiceServer;
 use crate::wallet::wallet_service_server::WalletServiceServer;
 use crate::DynWalletInfoProvider;
+
+pub use self::federation_setup::FederationSetupRPCServer;
 
 /// Error
 #[derive(Debug, Error)]
@@ -137,81 +140,12 @@ impl MintRPCServer {
     pub async fn start(&mut self, tls_dir: Option<PathBuf>) -> Result<(), Error> {
         tracing::info!("Starting RPC server {}", self.socket_addr);
 
-        #[cfg(not(target_arch = "wasm32"))]
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-
-        let server = match tls_dir {
-            Some(tls_dir) => {
-                tracing::info!("TLS configuration found, starting secure server");
-                let server_pem_path = tls_dir.join("server.pem");
-                let server_key_path = tls_dir.join("server.key");
-                let ca_pem_path = tls_dir.join("ca.pem");
-
-                if !server_pem_path.exists() {
-                    tracing::error!(
-                        "Server certificate file does not exist: {}",
-                        server_pem_path.display()
-                    );
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!(
-                            "Server certificate file not found: {}",
-                            server_pem_path.display()
-                        ),
-                    )));
-                }
-
-                if !server_key_path.exists() {
-                    tracing::error!(
-                        "Server key file does not exist: {}",
-                        server_key_path.display()
-                    );
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Server key file not found: {}", server_key_path.display()),
-                    )));
-                }
-
-                if !ca_pem_path.exists() {
-                    tracing::error!(
-                        "CA certificate file does not exist: {}",
-                        ca_pem_path.display()
-                    );
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("CA certificate file not found: {}", ca_pem_path.display()),
-                    )));
-                }
-
-                let cert = std::fs::read_to_string(&server_pem_path)?;
-                let key = std::fs::read_to_string(&server_key_path)?;
-                let client_ca_cert = std::fs::read_to_string(&ca_pem_path)?;
-                let client_ca_cert = Certificate::from_pem(client_ca_cert);
-                let server_identity = Identity::from_pem(cert, key);
-                let tls_config = ServerTlsConfig::new()
-                    .identity(server_identity)
-                    .client_ca_root(client_ca_cert);
-
-                Server::builder()
-                    .tls_config(tls_config)?
-                    .add_service(MintInfoServiceServer::new(self.clone()))
-                    .add_service(KeysetServiceServer::new(self.clone()))
-                    .add_service(PaymentMethodServiceServer::new(self.clone()))
-                    .add_service(QuoteServiceServer::new(self.clone()))
-                    .add_service(WalletServiceServer::new(self.clone()))
-            }
-            None => {
-                tracing::warn!("No valid TLS configuration found, starting insecure server");
-                Server::builder()
-                    .add_service(MintInfoServiceServer::new(self.clone()))
-                    .add_service(KeysetServiceServer::new(self.clone()))
-                    .add_service(PaymentMethodServiceServer::new(self.clone()))
-                    .add_service(QuoteServiceServer::new(self.clone()))
-                    .add_service(WalletServiceServer::new(self.clone()))
-            }
-        };
+        let server = server_builder(tls_dir)?
+            .add_service(MintInfoServiceServer::new(self.clone()))
+            .add_service(KeysetServiceServer::new(self.clone()))
+            .add_service(PaymentMethodServiceServer::new(self.clone()))
+            .add_service(QuoteServiceServer::new(self.clone()))
+            .add_service(WalletServiceServer::new(self.clone()));
 
         let shutdown = self.shutdown.clone();
         let addr = self.socket_addr;
@@ -248,6 +182,74 @@ impl Drop for MintRPCServer {
         tracing::debug!("Dropping mint rpc server");
         self.shutdown.notify_one();
     }
+}
+
+/// Creates a server builder, with mutual TLS when `tls_dir` is given.
+///
+/// The TLS directory must contain `server.pem`, `server.key`, and `ca.pem`,
+/// the CA that client certificates must chain to.
+fn server_builder(tls_dir: Option<PathBuf>) -> Result<Server, Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    let Some(tls_dir) = tls_dir else {
+        tracing::warn!("No valid TLS configuration found, starting insecure server");
+        return Ok(Server::builder());
+    };
+
+    tracing::info!("TLS configuration found, starting secure server");
+    let server_pem_path = tls_dir.join("server.pem");
+    let server_key_path = tls_dir.join("server.key");
+    let ca_pem_path = tls_dir.join("ca.pem");
+
+    if !server_pem_path.exists() {
+        tracing::error!(
+            "Server certificate file does not exist: {}",
+            server_pem_path.display()
+        );
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Server certificate file not found: {}",
+                server_pem_path.display()
+            ),
+        )));
+    }
+
+    if !server_key_path.exists() {
+        tracing::error!(
+            "Server key file does not exist: {}",
+            server_key_path.display()
+        );
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Server key file not found: {}", server_key_path.display()),
+        )));
+    }
+
+    if !ca_pem_path.exists() {
+        tracing::error!(
+            "CA certificate file does not exist: {}",
+            ca_pem_path.display()
+        );
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("CA certificate file not found: {}", ca_pem_path.display()),
+        )));
+    }
+
+    let cert = std::fs::read_to_string(&server_pem_path)?;
+    let key = std::fs::read_to_string(&server_key_path)?;
+    let client_ca_cert = std::fs::read_to_string(&ca_pem_path)?;
+    let client_ca_cert = Certificate::from_pem(client_ca_cert);
+    let server_identity = Identity::from_pem(cert, key);
+    let tls_config = ServerTlsConfig::new()
+        .identity(server_identity)
+        .client_ca_root(client_ca_cert);
+
+    Ok(Server::builder().tls_config(tls_config)?)
 }
 
 fn page_limit(requested: u32, default: u32, maximum: u32) -> Result<usize, Status> {

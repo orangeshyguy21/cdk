@@ -27,6 +27,7 @@ versioned package under `src/proto/` and is served on the same port.
 | `PaymentMethodService` | `cdk_mint_payment_method_v1` | Mint (NUT-04) and melt (NUT-05) method settings, and the mint-wide disabled flags |
 | `QuoteService` | `cdk_mint_quote_v1` | Quote time-to-live settings and mint quote state overrides |
 | `WalletService` | `cdk_mint_wallet_v1` | On-chain wallet balance, deposit addresses, and transactions |
+| `FederationSetupService` | `cdk_mint_federation_setup_v1` | Federation setup: create or join, propose, review, approve, status, and activate. Served on its own while the daemon is in setup mode, before any mint exists |
 
 Each package name carries its API version (`_v1`). Incompatible changes go in a
 new package version, served alongside the old one.
