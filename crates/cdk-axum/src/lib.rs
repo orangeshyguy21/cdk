@@ -172,6 +172,7 @@ enum FederationRouterStartup {
     Automatic,
     Prepared,
     Setup,
+    PreparedSetup,
     #[cfg(test)]
     LocalFinality,
 }
@@ -239,6 +240,36 @@ pub async fn create_federation_dkg_setup_router_with_transport(
     )
     .await
     .map(|built| built.router)
+}
+
+/// Prepare the isolated setup DKG routes and workers for explicit lifecycle ownership.
+///
+/// The returned services are not started; the caller starts them and owns shutdown.
+#[cfg(feature = "federation")]
+pub async fn prepare_federation_dkg_setup_router_with_transport(
+    mint: Arc<Mint>,
+    peer_sync: FederationPeerSyncConfig,
+    dkg: FederationDkgAutoStartConfig,
+    transport: FederationTransport,
+) -> Result<(Router, Option<FederationServices>)> {
+    let built = create_mint_router_with_custom_cache_inner(
+        mint,
+        HttpCache::default(),
+        Vec::new(),
+        false,
+        FederationRouterConfig {
+            peer_sync,
+            dkg: Some(dkg),
+            transport,
+            #[cfg(feature = "federation-bdk")]
+            bdk: None,
+            #[cfg(feature = "federation-bark")]
+            bark: None,
+        },
+        FederationRouterStartup::PreparedSetup,
+    )
+    .await?;
+    Ok((built.router, built.services))
 }
 
 /// Prepare federation routes and workers for explicit daemon lifecycle ownership.
@@ -313,7 +344,10 @@ async fn create_mint_router_with_custom_cache_inner(
         FederationRouterStartup::Automatic | FederationRouterStartup::Prepared
     );
     #[cfg(feature = "federation")]
-    let federation_setup_only = matches!(startup, FederationRouterStartup::Setup);
+    let federation_setup_only = matches!(
+        startup,
+        FederationRouterStartup::Setup | FederationRouterStartup::PreparedSetup
+    );
     #[cfg(all(test, feature = "federation"))]
     let federation_local_finality_test = matches!(startup, FederationRouterStartup::LocalFinality);
     #[cfg(all(feature = "federation", feature = "prometheus"))]
@@ -483,6 +517,12 @@ async fn create_mint_router_with_custom_cache_inner(
             ))
             .layer(from_fn(cors_middleware))
             .with_state(state);
+        if matches!(startup, FederationRouterStartup::PreparedSetup) {
+            return Ok(BuiltMintRouter {
+                router,
+                services: federation_services,
+            });
+        }
         let router = match federation_services.take() {
             Some(services) => router.layer(axum::Extension(Arc::new(services.start().await?))),
             None => router,
