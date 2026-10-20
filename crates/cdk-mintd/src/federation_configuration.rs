@@ -744,6 +744,91 @@ pub(crate) fn federation_chain_source(
     Ok(chain_source)
 }
 
+/// Build the DKG driver limits from member-local settings.
+pub(crate) fn federation_dkg_driver_config(
+    dkg: &config::FederationDkg,
+) -> Result<cdk_axum::FederationDkgDriverRunConfig> {
+    if dkg.max_ticks == 0 {
+        bail!("federation.dkg.max_ticks must be greater than zero");
+    }
+    if dkg.retry_delay_ms == 0 {
+        bail!("federation.dkg.retry_delay_ms must be greater than zero");
+    }
+    if dkg.ceremony_timeout_secs == 0 {
+        bail!("federation.dkg.ceremony_timeout_secs must be greater than zero");
+    }
+    if !(1..=64).contains(&dkg.member_request_burst) {
+        bail!("federation.dkg.member_request_burst must be between 1 and 64");
+    }
+    if dkg.member_request_refill_ms < 10 {
+        bail!("federation.dkg.member_request_refill_ms must be at least 10");
+    }
+    Ok(cdk_axum::FederationDkgDriverRunConfig {
+        max_ticks: dkg.max_ticks,
+        retry_delay: std::time::Duration::from_millis(dkg.retry_delay_ms),
+        ceremony_timeout: std::time::Duration::from_secs(dkg.ceremony_timeout_secs),
+        secret_share_transport:
+            cdk_axum::FederationDkgSecretShareTransportPolicy::RequireSecureTransport,
+        member_request_burst: dkg.member_request_burst,
+        member_request_refill_interval: std::time::Duration::from_millis(
+            dkg.member_request_refill_ms,
+        ),
+    })
+}
+
+/// Whether the settings start the daemon in management-RPC-driven setup mode.
+pub(crate) fn federation_setup_mode_enabled(settings: &config::Settings) -> bool {
+    settings
+        .federation
+        .as_ref()
+        .is_some_and(|federation| federation.setup.enabled)
+}
+
+/// Reject setup-mode combinations that conflict with other federation startup modes.
+pub(crate) fn validate_federation_setup_mode(settings: &config::Settings) -> Result<()> {
+    let Some(federation) = settings.federation.as_ref() else {
+        return Ok(());
+    };
+    if !federation.setup.enabled {
+        return Ok(());
+    }
+    if !federation.enabled {
+        bail!("federation.setup.enabled requires federation.enabled=true");
+    }
+    if federation.public_config_path.is_some() || federation.private_config_path.is_some() {
+        bail!(
+            "federation.setup.enabled cannot be combined with federation.public_config_path or federation.private_config_path"
+        );
+    }
+    if federation.restore_manifest_path.is_some() {
+        bail!("federation.setup.enabled cannot be combined with federation.restore_manifest_path");
+    }
+    if federation.dkg.enabled || federation.setup_config_path.is_some() {
+        bail!(
+            "federation.setup.enabled replaces federation.dkg.enabled and federation.setup_config_path"
+        );
+    }
+    federation_dkg_driver_config(&federation.dkg)?;
+    validate_setup_mode_management_rpc(settings)
+}
+
+#[cfg(feature = "management-rpc")]
+fn validate_setup_mode_management_rpc(settings: &config::Settings) -> Result<()> {
+    if !settings
+        .mint_management_rpc
+        .as_ref()
+        .is_some_and(|rpc| rpc.enabled)
+    {
+        bail!("federation.setup.enabled requires [mint_management_rpc] enabled = true");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "management-rpc"))]
+fn validate_setup_mode_management_rpc(_settings: &config::Settings) -> Result<()> {
+    bail!("federation.setup.enabled requires the `management-rpc` feature")
+}
+
 pub(crate) fn federation_dkg_auto_start_config(
     settings: &config::Settings,
 ) -> Result<Option<cdk_axum::FederationDkgAutoStartConfig>> {
@@ -756,37 +841,12 @@ pub(crate) fn federation_dkg_auto_start_config(
     if !federation.enabled {
         bail!("federation.dkg.enabled requires federation.enabled=true");
     }
-    if federation.dkg.max_ticks == 0 {
-        bail!("federation.dkg.max_ticks must be greater than zero");
-    }
-    if federation.dkg.retry_delay_ms == 0 {
-        bail!("federation.dkg.retry_delay_ms must be greater than zero");
-    }
-    if federation.dkg.ceremony_timeout_secs == 0 {
-        bail!("federation.dkg.ceremony_timeout_secs must be greater than zero");
-    }
-    if !(1..=64).contains(&federation.dkg.member_request_burst) {
-        bail!("federation.dkg.member_request_burst must be between 1 and 64");
-    }
-    if federation.dkg.member_request_refill_ms < 10 {
-        bail!("federation.dkg.member_request_refill_ms must be at least 10");
-    }
+    let driver = federation_dkg_driver_config(&federation.dkg)?;
     let setup_config_path = federation
         .setup_config_path
         .as_deref()
         .ok_or_else(|| anyhow!("federation.setup_config_path must be set when DKG is enabled"))?;
     let handoff = federation_setup_command::load_certified_dkg_handoff(setup_config_path)?;
-    let driver = cdk_axum::FederationDkgDriverRunConfig {
-        max_ticks: federation.dkg.max_ticks,
-        retry_delay: std::time::Duration::from_millis(federation.dkg.retry_delay_ms),
-        ceremony_timeout: std::time::Duration::from_secs(federation.dkg.ceremony_timeout_secs),
-        secret_share_transport:
-            cdk_axum::FederationDkgSecretShareTransportPolicy::RequireSecureTransport,
-        member_request_burst: federation.dkg.member_request_burst,
-        member_request_refill_interval: std::time::Duration::from_millis(
-            federation.dkg.member_request_refill_ms,
-        ),
-    };
     cdk_axum::FederationDkgAutoStartConfig::from_manifest(
         &handoff.manifest,
         handoff.url_policy,

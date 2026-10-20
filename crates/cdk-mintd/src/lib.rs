@@ -105,6 +105,8 @@ mod federation_payment_observations;
 mod federation_setup;
 #[cfg(feature = "federation")]
 mod federation_setup_command;
+#[cfg(all(feature = "federation", feature = "management-rpc", feature = "sqlite"))]
+mod federation_setup_mode;
 #[cfg(all(feature = "federation", feature = "fakewallet", feature = "sqlite"))]
 mod federation_smoke;
 #[cfg(feature = "federation")]
@@ -832,6 +834,8 @@ pub(crate) fn validate_settings(settings: &config::Settings) -> Result<()> {
     validate_auth_config(settings)?;
     validate_management_rpc_config(settings)?;
     validate_prometheus_config(settings)?;
+    #[cfg(feature = "federation")]
+    validate_federation_setup_mode(settings)?;
 
     Ok(())
 }
@@ -2475,9 +2479,15 @@ impl PreparedMintd {
         routers: Vec<Router>,
         auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
         activation: Option<ConfigurationActivation>,
+        iroh_handover: IrohHandover,
     ) -> Result<Self> {
         #[cfg(feature = "iroh")]
-        let iroh_runtime = iroh_runtime::initialize(settings, _work_dir).await?;
+        let iroh_runtime = match iroh_handover {
+            Some(runtime) => Some(runtime),
+            None => iroh_runtime::initialize(settings, _work_dir).await?,
+        };
+        #[cfg(not(feature = "iroh"))]
+        let _ = iroh_handover;
         #[cfg(all(feature = "iroh", feature = "federation"))]
         iroh_runtime::validate_federation_roster(settings, iroh_runtime.as_ref())?;
         #[cfg(not(feature = "iroh"))]
@@ -2518,48 +2528,29 @@ impl PreparedMintd {
 
         #[cfg(feature = "management-rpc")]
         {
-            if let Some(rpc_settings) = settings.mint_management_rpc.clone() {
-                if rpc_settings.enabled {
-                    let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
-                    let port = rpc_settings.port.unwrap_or(8086);
-                    let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(&addr, port, mint.clone())?
-                        .with_mint_quote_payment_override(
-                            rpc_settings.allow_mint_quote_payment_override,
-                        );
-                    if let Some(activation) = activation.as_ref() {
-                        mint_rpc =
-                            mint_rpc.with_mutation_guard(Arc::new(ConfigurationMutationGuard {
-                                service: activation.service.clone(),
-                            }));
-                    }
-                    #[cfg(feature = "bdk")]
-                    if let Some(provider) = _wallet_info_provider.clone() {
-                        mint_rpc = mint_rpc.with_wallet_info_provider(provider);
-                    }
-
-                    let tls_dir = rpc_settings.tls_dir.unwrap_or(_work_dir.join("tls"));
-
-                    let tls_dir = if tls_dir.exists() {
-                        Some(tls_dir)
-                    } else if rpc_settings.allow_insecure {
-                        tracing::warn!(
-                        "TLS directory does not exist: {}. Starting RPC server in INSECURE mode without TLS encryption because allow_insecure is true",
-                        tls_dir.display()
-                    );
-                        None
-                    } else {
-                        bail!(
-                            "Management RPC TLS directory does not exist: {}. Set \
-                         [mint_management_rpc].tls_dir or \
-                         [mint_management_rpc].allow_insecure = true to start without \
-                         TLS",
-                            tls_dir.display()
-                        );
-                    };
-
-                    rpc_to_start = Some((mint_rpc, tls_dir));
-                    rpc_enabled = true;
+            if let Some(endpoint) = management_rpc_endpoint(settings, _work_dir)? {
+                let allow_mint_quote_payment_override = settings
+                    .mint_management_rpc
+                    .as_ref()
+                    .is_some_and(|rpc| rpc.allow_mint_quote_payment_override);
+                let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(
+                    &endpoint.address,
+                    endpoint.port,
+                    mint.clone(),
+                )?
+                .with_mint_quote_payment_override(allow_mint_quote_payment_override);
+                if let Some(activation) = activation.as_ref() {
+                    mint_rpc = mint_rpc.with_mutation_guard(Arc::new(ConfigurationMutationGuard {
+                        service: activation.service.clone(),
+                    }));
                 }
+                #[cfg(feature = "bdk")]
+                if let Some(provider) = _wallet_info_provider.clone() {
+                    mint_rpc = mint_rpc.with_wallet_info_provider(provider);
+                }
+
+                rpc_to_start = Some((mint_rpc, endpoint.tls_dir));
+                rpc_enabled = true;
             }
         }
 
@@ -3001,6 +2992,7 @@ async fn start_services_with_shutdown(
     routers: Vec<Router>,
     auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
     activation: Option<ConfigurationActivation>,
+    iroh_handover: IrohHandover,
 ) -> Result<()> {
     let prepared = PreparedMintd::prepare(
         mint,
@@ -3011,6 +3003,7 @@ async fn start_services_with_shutdown(
         routers,
         auth_localstore,
         activation,
+        iroh_handover,
     )
     .await?;
     let running = prepared.activate().await?;
@@ -3130,10 +3123,93 @@ async fn serve_public_listeners(
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        result.expect("failed to install CTRL+C handler");
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Failed to install SIGTERM handler; only CTRL+C stops mintd");
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to install CTRL+C handler");
+            }
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c()
         .await
         .expect("failed to install CTRL+C handler");
     tracing::info!("Shutdown signal received");
+}
+
+/// An Iroh endpoint handed from federation setup mode to normal startup, so the
+/// same identity is never bound twice in one process.
+#[cfg(feature = "iroh")]
+type IrohHandover = Option<iroh_runtime::MintdIrohRuntime>;
+/// Without Iroh there is nothing to hand over.
+#[cfg(not(feature = "iroh"))]
+#[derive(Debug, Default)]
+struct IrohHandover {
+    _nothing: (),
+}
+
+/// Management RPC bind address and TLS directory.
+#[cfg(feature = "management-rpc")]
+pub(crate) struct ManagementRpcEndpoint {
+    pub(crate) address: String,
+    pub(crate) port: u16,
+    pub(crate) tls_dir: Option<PathBuf>,
+}
+
+/// Resolve the management RPC endpoint, or `None` when the RPC is disabled.
+#[cfg(feature = "management-rpc")]
+pub(crate) fn management_rpc_endpoint(
+    settings: &config::Settings,
+    work_dir: &Path,
+) -> Result<Option<ManagementRpcEndpoint>> {
+    let Some(rpc_settings) = settings
+        .mint_management_rpc
+        .as_ref()
+        .filter(|rpc| rpc.enabled)
+    else {
+        return Ok(None);
+    };
+    let address = rpc_settings
+        .address
+        .clone()
+        .unwrap_or("127.0.0.1".to_string());
+    let port = rpc_settings.port.unwrap_or(8086);
+    let tls_dir = rpc_settings.tls_dir.clone().unwrap_or(work_dir.join("tls"));
+    let tls_dir = if tls_dir.exists() {
+        Some(tls_dir)
+    } else if rpc_settings.allow_insecure {
+        tracing::warn!(
+            "TLS directory does not exist: {}. Starting RPC server in INSECURE mode without TLS encryption because allow_insecure is true",
+            tls_dir.display()
+        );
+        None
+    } else {
+        bail!(
+            "Management RPC TLS directory does not exist: {}. Set \
+             [mint_management_rpc].tls_dir or \
+             [mint_management_rpc].allow_insecure = true to start without TLS",
+            tls_dir.display()
+        );
+    };
+    Ok(Some(ManagementRpcEndpoint {
+        address,
+        port,
+        tls_dir,
+    }))
 }
 
 fn work_dir() -> Result<PathBuf> {
@@ -3194,6 +3270,10 @@ pub async fn run_mintd_with_shutdown(
 ) -> Result<()> {
     #[cfg(feature = "federation-bark")]
     cdk_federation_bark::register_federation_bark_wire_codec()?;
+    #[cfg(feature = "federation")]
+    if federation_setup_mode_enabled(settings) {
+        bail!("federation setup mode requires the database-backed `cdk-mintd` daemon");
+    }
 
     let (localstore, keystore, kv, _configuration_store) =
         initial_setup(work_dir, settings, db_password.clone()).await?;
@@ -3210,6 +3290,7 @@ pub async fn run_mintd_with_shutdown(
         routers,
         None,
         None,
+        IrohHandover::default(),
     )
     .await
 }
@@ -3227,6 +3308,7 @@ async fn run_mintd_with_database_and_shutdown(
     routers: Vec<Router>,
     activation: Option<ConfigurationActivation>,
     validated_signing_source: Option<ValidatedSigningSource>,
+    iroh_handover: IrohHandover,
 ) -> Result<()> {
     #[cfg(feature = "federation")]
     federation_backup::validate_configured_restore(settings, &localstore).await?;
@@ -3302,6 +3384,7 @@ async fn run_mintd_with_database_and_shutdown(
         routers,
         auth_localstore,
         activation,
+        iroh_handover,
     )
     .await
 }
@@ -3447,6 +3530,10 @@ async fn load_stored_settings(work_dir: &Path, args: &CLIArgs) -> Result<config:
 }
 
 /// Runs mintd using only the configuration stored in its primary database.
+#[cfg_attr(
+    not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
+    allow(clippy::never_loop)
+)]
 pub async fn run_mintd_from_database(
     work_dir: &Path,
     db_password: Option<String>,
@@ -3459,46 +3546,98 @@ pub async fn run_mintd_from_database(
     let bootstrap = load_database_bootstrap_settings()?;
     let (localstore, keystore, kv, configuration_store) =
         initial_setup(work_dir, &bootstrap, db_password.clone()).await?;
-    let service = configuration_service(configuration_store, &bootstrap);
-    let startup = service.startup().await?;
-    config_service::require_existing_bdk_wallet(
-        &startup.resolved.settings,
-        work_dir,
-        startup.bdk_wallet_policy,
-    )?;
-    let validated_signing_source = Some(ValidatedSigningSource {
-        expected_pubkey: startup.signing_identity.pubkey,
-        remote_signatory: startup
-            .remote_signatory
-            .map(|signatory| -> DynSignatory { signatory }),
-    });
-    let activation = Some(ConfigurationActivation::new(
-        service,
-        startup.state,
-        startup.revision,
-    ));
-    let settings = startup.resolved.settings;
-
+    #[cfg_attr(
+        not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
+        allow(unused_mut)
+    )]
+    let mut service = configuration_service(configuration_store.clone(), &bootstrap);
+    #[cfg_attr(
+        not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
+        allow(unused_mut)
+    )]
+    let mut startup = service.startup().await?;
     let guard = if enable_logging {
-        setup_tracing(work_dir, &settings.info.logging)?
+        setup_tracing(work_dir, &startup.resolved.settings.info.logging)?
     } else {
         None
     };
+    #[cfg_attr(
+        not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
+        allow(unused_mut)
+    )]
+    let mut iroh_handover = IrohHandover::default();
 
-    let result = run_mintd_with_database_and_shutdown(
-        work_dir,
-        &settings,
-        localstore,
-        keystore,
-        kv,
-        shutdown_signal(),
-        db_password,
-        runtime,
-        routers,
-        activation,
-        validated_signing_source,
-    )
-    .await;
+    // Setup mode runs until activation, then the loop restarts from the newly
+    // applied configuration as a normal federation member in this process.
+    let result = loop {
+        config_service::require_existing_bdk_wallet(
+            &startup.resolved.settings,
+            work_dir,
+            startup.bdk_wallet_policy,
+        )?;
+
+        #[cfg(feature = "federation")]
+        if federation_setup_mode_enabled(&startup.resolved.settings) {
+            #[cfg(all(feature = "management-rpc", feature = "sqlite"))]
+            {
+                let exit = federation_setup_mode::run_federation_setup_mode(
+                    work_dir,
+                    &startup.resolved.settings,
+                    localstore.clone(),
+                    service,
+                    startup.bdk_wallet_policy,
+                    shutdown_signal(),
+                )
+                .await;
+                match exit {
+                    Ok(federation_setup_mode::SetupModeExit::Activated { iroh }) => {
+                        tracing::info!(
+                            "Federation setup activated; starting as a federation member"
+                        );
+                        iroh_handover = iroh;
+                        service = configuration_service(configuration_store.clone(), &bootstrap);
+                        startup = service.startup().await?;
+                        continue;
+                    }
+                    Ok(federation_setup_mode::SetupModeExit::Shutdown) => break Ok(()),
+                    Err(error) => break Err(error),
+                }
+            }
+            #[cfg(not(all(feature = "management-rpc", feature = "sqlite")))]
+            break Err(anyhow!(
+                "federation setup mode requires the `management-rpc` and `sqlite` features"
+            ));
+        }
+
+        let validated_signing_source = Some(ValidatedSigningSource {
+            expected_pubkey: startup.signing_identity.pubkey,
+            remote_signatory: startup
+                .remote_signatory
+                .map(|signatory| -> DynSignatory { signatory }),
+        });
+        let activation = Some(ConfigurationActivation::new(
+            service,
+            startup.state,
+            startup.revision,
+        ));
+        let settings = startup.resolved.settings;
+
+        break run_mintd_with_database_and_shutdown(
+            work_dir,
+            &settings,
+            localstore,
+            keystore,
+            kv,
+            shutdown_signal(),
+            db_password,
+            runtime,
+            routers,
+            activation,
+            validated_signing_source,
+            iroh_handover,
+        )
+        .await;
+    };
 
     if let Some(guard) = guard {
         tracing::info!("Shutting down logging worker thread");
@@ -4582,6 +4721,7 @@ engine = "sqlite"
                 restore_manifest_path: None,
                 peer_sync: config::FederationPeerSync::default(),
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -4744,6 +4884,7 @@ engine = "sqlite"
                 restore_manifest_path: None,
                 peer_sync: config::FederationPeerSync::default(),
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -4810,6 +4951,7 @@ engine = "sqlite"
                     aleph_bft_live_session_rotation_limit: Some(71),
                 },
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -4862,6 +5004,7 @@ engine = "sqlite"
         let mut settings = config::Settings {
             federation: Some(config::Federation {
                 enabled: true,
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet {
                     enabled: true,
                     chain_source_type: "esplora".to_string(),
@@ -4949,6 +5092,7 @@ engine = "sqlite"
             }),
             federation: Some(config::Federation {
                 enabled: true,
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet {
                     enabled: true,
                     network: Some("regtest".to_string()),
@@ -4994,6 +5138,7 @@ engine = "sqlite"
         let mut settings = config::Settings {
             federation: Some(config::Federation {
                 enabled: true,
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet {
                     enabled: true,
                     chain_source_type: "esplora".to_string(),
@@ -5074,6 +5219,7 @@ engine = "sqlite"
                     ..config::FederationPeerSync::default()
                 },
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -5267,6 +5413,7 @@ engine = "sqlite"
                 restore_manifest_path: None,
                 peer_sync: config::FederationPeerSync::default(),
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -5322,6 +5469,7 @@ engine = "sqlite"
                 restore_manifest_path: None,
                 peer_sync: config::FederationPeerSync::default(),
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -5349,6 +5497,7 @@ engine = "sqlite"
                 restore_manifest_path: None,
                 peer_sync: config::FederationPeerSync::default(),
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -5399,6 +5548,7 @@ engine = "sqlite"
                 restore_manifest_path: None,
                 peer_sync: config::FederationPeerSync::default(),
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -5436,6 +5586,7 @@ engine = "sqlite"
                 restore_manifest_path: None,
                 peer_sync: config::FederationPeerSync::default(),
                 dkg: config::FederationDkg::default(),
+                setup: config::FederationSetup::default(),
                 onchain_wallet: config::FederationOnchainWallet::default(),
                 #[cfg(feature = "federation-bark")]
                 bark: config::FederationBarkWallet::default(),
@@ -5534,6 +5685,7 @@ engine = "sqlite"
                     restore_manifest_path: None,
                     peer_sync: config::FederationPeerSync::default(),
                     dkg: config::FederationDkg::default(),
+                    setup: config::FederationSetup::default(),
                     onchain_wallet: config::FederationOnchainWallet::default(),
                     #[cfg(feature = "federation-bark")]
                     bark: config::FederationBarkWallet::default(),

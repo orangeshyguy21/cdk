@@ -1500,6 +1500,9 @@ pub struct Federation {
     /// Optional dealer-free DKG ceremony to start or resume in setup mode.
     #[serde(default)]
     pub dkg: FederationDkg,
+    /// Management-RPC-driven federation setup for a fresh member.
+    #[serde(default)]
+    pub setup: FederationSetup,
     /// Member-local watch-only BDK storage and chain source.
     #[serde(default)]
     pub onchain_wallet: FederationOnchainWallet,
@@ -1709,6 +1712,20 @@ fn default_federation_onchain_source_type() -> String {
 #[cfg(feature = "federation")]
 fn default_federation_onchain_source_scope() -> String {
     "independent".to_string()
+}
+
+/// Federation setup mode settings.
+///
+/// When enabled, the daemon serves only the management RPC setup service and the
+/// setup coordinator and DKG routes until the member is activated, then continues
+/// as a normal federation member in the same process.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg(feature = "federation")]
+#[serde(deny_unknown_fields)]
+pub struct FederationSetup {
+    /// Start this member in setup mode instead of as a running mint.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Dealer-free DKG auto-start settings for one federation member.
