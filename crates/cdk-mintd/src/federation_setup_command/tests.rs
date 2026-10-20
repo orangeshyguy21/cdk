@@ -278,6 +278,8 @@ async fn independent_operators_review_and_approve_without_copying_private_materi
     )
     .await
     .expect("creator setup");
+    let creator_service = build_setup_coordinator_service(creator_db.clone(), &creator_config)
+        .expect("creator coordinator service");
     let creator_secrets_before =
         std::fs::read(creator_dir.join(LOCAL_SETUP_SECRETS_FILE)).expect("creator secrets bytes");
 
@@ -409,6 +411,7 @@ async fn independent_operators_review_and_approve_without_copying_private_materi
     let wrong_hash_approval = approve_setup(
         &member_three_db,
         &coordinator,
+        None,
         &member_three_config,
         FederationSetupProposalHash::from_bytes([42; 32]),
         NOW_UNIX + 4,
@@ -424,6 +427,7 @@ async fn independent_operators_review_and_approve_without_copying_private_materi
     let creator_approval = approve_setup(
         creator_db.as_ref(),
         &coordinator,
+        Some(creator_service.as_ref()),
         &creator_config,
         proposal.proposal_hash,
         NOW_UNIX + 4,
@@ -433,6 +437,7 @@ async fn independent_operators_review_and_approve_without_copying_private_materi
     let first_approval = approve_setup(
         &member_two_db,
         &coordinator,
+        None,
         &member_two_config,
         proposal.proposal_hash,
         NOW_UNIX + 4,
@@ -450,6 +455,7 @@ async fn independent_operators_review_and_approve_without_copying_private_materi
     let member_two_approval = approve_setup(
         &member_two_db,
         &coordinator,
+        None,
         &member_two_config,
         proposal.proposal_hash,
         NOW_UNIX + 5,
@@ -460,6 +466,7 @@ async fn independent_operators_review_and_approve_without_copying_private_materi
     let member_three_approval = approve_setup(
         &member_three_db,
         &coordinator,
+        None,
         &member_three_config,
         proposal.proposal_hash,
         NOW_UNIX + 4,
@@ -699,19 +706,11 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
         member_two_review.expect("member two review"),
         member_three_review.expect("member three review")
     );
-    approve_setup(
-        creator_db.as_ref(),
-        &coordinator,
-        &creator_config,
-        proposal.proposal_hash,
-        now,
-    )
-    .await
-    .expect("creator approval");
     let (member_two_approval, member_three_approval) = tokio::join!(
         approve_setup(
             &member_two_db,
             &coordinator,
+            None,
             &member_two_config,
             proposal.proposal_hash,
             now,
@@ -719,6 +718,7 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
         approve_setup(
             &member_three_db,
             &coordinator,
+            None,
             &member_three_config,
             proposal.proposal_hash,
             now,
@@ -726,6 +726,24 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
     );
     member_two_approval.expect("member two approval");
     member_three_approval.expect("member three approval");
+    assert_eq!(
+        setup_status(&creator_config)
+            .await
+            .expect("creator status before its approval")
+            .coordinator_phase,
+        Some("proposal_published".to_string())
+    );
+    // The creator approves last; its local approval must certify the manifest.
+    approve_setup(
+        creator_db.as_ref(),
+        &coordinator,
+        Some(service.as_ref()),
+        &creator_config,
+        proposal.proposal_hash,
+        now,
+    )
+    .await
+    .expect("creator approval");
 
     let (member_two_status, member_three_status) = tokio::join!(
         setup_status(&member_two_config),
@@ -881,6 +899,25 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
         );
     }
 
+    // Member three refuses final-config confirmations until released, so the
+    // others collect all three while theirs have not reached member three yet.
+    let hold_confirmations = Arc::new(AtomicBool::new(true));
+    let held = hold_confirmations.clone();
+    routers[2] = routers[2].clone().layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let held = held.clone();
+            async move {
+                if held.load(Ordering::SeqCst) && request.uri().path().ends_with("/dkg/activations")
+                {
+                    return axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    );
+                }
+                next.run(request).await
+            }
+        },
+    ));
+
     let listeners = [
         creator_dkg_listener,
         member_two_dkg_listener,
@@ -900,6 +937,53 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
                 .expect("DKG server");
         }));
     }
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let mut collected = true;
+            for database in &databases[..2] {
+                collected &= database
+                    .get_federation_dkg_activations()
+                    .await
+                    .expect("DKG activations while holding")
+                    .len()
+                    == 3;
+            }
+            if collected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("members one and two collect every confirmation");
+    let creator_id = MemberId::new(1).expect("creator member ID");
+    assert!(
+        databases[2]
+            .get_federation_dkg_activations()
+            .await
+            .expect("member three DKG activations while holding")
+            .iter()
+            .all(|activation| activation.signer != creator_id),
+        "member three must still be missing the creator's confirmation"
+    );
+    for config_path in [&creator_config, &member_two_config] {
+        let status = setup_status(config_path)
+            .await
+            .expect("setup status while holding");
+        assert_eq!(status.participant_phase, "dkg_running");
+        let dkg = status.dkg.expect("DKG progress while holding");
+        assert_eq!(dkg.final_config_confirmations, 3);
+        assert!(
+            !dkg.finalized_ready,
+            "a member whose confirmation is undelivered must not report ready"
+        );
+        let error = activate_setup(config_path, now)
+            .await
+            .expect_err("activation must wait for every member to receive the confirmation");
+        assert!(error.to_string().contains("every member has received"));
+    }
+    hold_confirmations.store(false, Ordering::SeqCst);
 
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {

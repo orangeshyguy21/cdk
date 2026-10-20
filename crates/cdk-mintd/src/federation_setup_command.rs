@@ -171,13 +171,28 @@ pub(crate) async fn run_setup_command(
             let coordinator =
                 HttpSetupCoordinator::new(crate::federation_setup_transport(cli_args).await?);
             let config = read_local_config(&args.config)?;
-            let db = cdk_sqlite::MintSqliteDatabase::new(config.database_path().to_path_buf())
-                .await
-                .context("failed to open federation setup database")?;
+            let db = Arc::new(
+                cdk_sqlite::MintSqliteDatabase::new(config.database_path().to_path_buf())
+                    .await
+                    .context("failed to open federation setup database")?,
+            );
+            let local_coordinator = match config.local_role {
+                FederationSetupLocalRole::Coordinator { .. } => {
+                    Some(build_setup_coordinator_service(db.clone(), &args.config)?)
+                }
+                FederationSetupLocalRole::Member { .. } => None,
+            };
             let hash = FederationSetupProposalHash::from_str(&args.proposal_hash)
                 .context("invalid exact proposal hash")?;
-            let approval =
-                approve_setup(&db, &coordinator, &args.config, hash, current_unix_time()?).await?;
+            let approval = approve_setup(
+                db.as_ref(),
+                &coordinator,
+                local_coordinator.as_deref(),
+                &args.config,
+                hash,
+                current_unix_time()?,
+            )
+            .await?;
             println!("approved_proposal_hash: {}", approval.proposal_hash);
         }
         cli::FederationSetupCommand::Serve(args) => {
@@ -514,6 +529,17 @@ pub(crate) fn build_setup_coordinator_router(
     database: cdk_common::database::DynMintDatabase,
     config_path: &Path,
 ) -> Result<SetupCoordinatorRouter> {
+    let service = build_setup_coordinator_service(database, config_path)?;
+    let router = cdk_axum::create_federation_setup_router(service.clone());
+    Ok(SetupCoordinatorRouter { router, service })
+}
+
+/// Build the creator's setup coordinator service over `database`.
+#[cfg(feature = "sqlite")]
+fn build_setup_coordinator_service(
+    database: cdk_common::database::DynMintDatabase,
+    config_path: &Path,
+) -> Result<Arc<cdk_axum::FederationSetupCoordinatorService>> {
     let (config, secrets) = load_local_state(config_path, current_unix_time()?)?;
     let draft = config
         .coordinator
@@ -523,19 +549,16 @@ pub(crate) fn build_setup_coordinator_router(
         .coordinator_secret_key
         .clone()
         .ok_or_else(|| anyhow!("protected setup coordinator identity is missing"))?;
-    let service = Arc::new(
-        cdk_axum::FederationSetupCoordinatorService::new(
-            database,
-            config.setup_id,
-            draft.threshold_params.member_count,
-            coordinator_secret_key,
-            config.url_policy,
-            cdk_axum::FederationSetupCoordinatorServiceConfig::default(),
-        )
-        .context("failed to initialize setup coordinator service")?,
-    );
-    let router = cdk_axum::create_federation_setup_router(service.clone());
-    Ok(SetupCoordinatorRouter { router, service })
+    let service = cdk_axum::FederationSetupCoordinatorService::new(
+        database,
+        config.setup_id,
+        draft.threshold_params.member_count,
+        coordinator_secret_key,
+        config.url_policy,
+        cdk_axum::FederationSetupCoordinatorServiceConfig::default(),
+    )
+    .context("failed to initialize setup coordinator service")?;
+    Ok(Arc::new(service))
 }
 
 /// Setup-only DKG routes plus their not-yet-started background services.
@@ -1326,11 +1349,18 @@ async fn activate_setup_with_db_and_faults(
     let handoff = load_certified_dkg_handoff_from_state(&config, now_unix)?;
     let records =
         crate::federation_dkg_status::read_database_records_from_database(&database).await?;
-    let (_, finalized) =
+    let (progress, finalized) =
         records.finalization_progress(&handoff.public_config, &handoff.private_config);
     let mut finalized = finalized.ok_or_else(|| anyhow!(
         "federation setup cannot activate before DKG and all final-config confirmations are complete"
     ))?;
+    // Activation stops this member's DKG driver, the only sender of its
+    // confirmation, so wait until every member has acknowledged it.
+    if !progress.finalized_ready {
+        bail!(
+            "federation setup cannot activate until every member has received this member's final-config confirmation; retry when status reports finalized_ready"
+        );
+    }
     crate::federation_dkg_status::attach_manifest_frost_applications(
         &mut finalized,
         records.frost_roots()?,
@@ -2465,9 +2495,15 @@ where
     review_local_proposal(db, config_path, proposal, now_unix).await
 }
 
+/// Sign, fence, and submit the local approval of the reviewed proposal.
+///
+/// A joining member submits it to `coordinator`. The creator has no invitation
+/// and records it with its own `local_coordinator` service, which certifies the
+/// manifest when this approval is the last one.
 pub(crate) async fn approve_setup<DB, C>(
     db: &DB,
     coordinator: &C,
+    local_coordinator: Option<&cdk_axum::FederationSetupCoordinatorService>,
     config_path: &Path,
     exact_proposal_hash: FederationSetupProposalHash,
     now_unix: u64,
@@ -2523,16 +2559,11 @@ where
         }
     };
     let Some(invitation) = secrets.invitation.as_ref() else {
-        let mut tx = Database::begin_transaction(db)
-            .await
-            .context("failed to begin local coordinator approval transaction")?;
-        tx.add_federation_setup_approval(&approval)
-            .await
-            .context("failed to persist local coordinator approval")?;
-        tx.commit()
-            .await
-            .context("failed to commit local coordinator approval")?;
-        return Ok(approval);
+        let local_coordinator = local_coordinator
+            .ok_or_else(|| anyhow!("the setup creator needs its coordinator service to approve"))?;
+        return local_coordinator.approve_local(approval).await.context(
+            "failed to record local coordinator approval; retry reuses the durable approval",
+        );
     };
     let acknowledged = coordinator
         .approve(invitation, &approval)

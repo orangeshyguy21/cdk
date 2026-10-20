@@ -528,6 +528,31 @@ impl FederationSetupCoordinatorService {
         authenticated: AuthenticatedInvitation,
         approval: FederationSetupApproval,
     ) -> Result<FederationSetupApproval, FederationSetupHttpError> {
+        if authenticated.invitation.member_id != approval.member_id {
+            return Err(FederationSetupHttpError::new(
+                FederationSetupHttpErrorCode::InvalidSignature,
+                "setup approval signer does not match its invitation",
+            ));
+        }
+        self.record_approval(approval).await
+    }
+
+    /// Record the setup creator's own approval.
+    ///
+    /// The creator has no invitation, so this skips invitation authentication
+    /// but otherwise takes the same path as a member's approval: whichever
+    /// approval completes the set certifies the manifest.
+    pub async fn approve_local(
+        &self,
+        approval: FederationSetupApproval,
+    ) -> Result<FederationSetupApproval, FederationSetupHttpError> {
+        self.record_approval(approval).await
+    }
+
+    async fn record_approval(
+        &self,
+        approval: FederationSetupApproval,
+    ) -> Result<FederationSetupApproval, FederationSetupHttpError> {
         let _approval_serial = self
             .approval_admission
             .clone()
@@ -535,12 +560,6 @@ impl FederationSetupCoordinatorService {
             .await
             .map_err(|_| rate_limited())?;
         let proposal = self.proposal().await?;
-        if authenticated.invitation.member_id != approval.member_id {
-            return Err(FederationSetupHttpError::new(
-                FederationSetupHttpErrorCode::InvalidSignature,
-                "setup approval signer does not match its invitation",
-            ));
-        }
         approval
             .validate(&proposal)
             .map_err(FederationSetupHttpError::from_federation)?;
@@ -549,24 +568,38 @@ impl FederationSetupCoordinatorService {
             .get_federation_setup_approvals(self.setup_id)
             .await
             .map_err(|_| FederationSetupHttpError::storage())?;
-        if let Some(existing) = existing
+        let replay = match existing
             .iter()
             .find(|existing| existing.member_id == approval.member_id)
         {
-            return match existing == &approval {
-                true => Ok(existing.clone()),
-                false => Err(FederationSetupHttpError::new(
+            Some(existing) if existing == &approval => true,
+            Some(_) => {
+                return Err(FederationSetupHttpError::new(
                     FederationSetupHttpErrorCode::Conflict,
                     "setup member already approved different content",
-                )),
-            };
-        }
+                ))
+            }
+            None => false,
+        };
         let mut approvals = existing
             .into_iter()
             .map(|existing| (existing.member_id, existing))
             .collect::<BTreeMap<_, _>>();
         approvals.insert(approval.member_id, approval.clone());
-        let certification = match approvals.len() == proposal.body.enrollments.len() {
+        // Whichever approval completes the set certifies the manifest. An exact
+        // replay certifies too if the set is complete but still uncertified,
+        // e.g. when the last approval was written by another process.
+        let certify = match (approvals.len() == proposal.body.enrollments.len(), replay) {
+            (false, _) => false,
+            (true, false) => true,
+            (true, true) => self
+                .database
+                .get_federation_setup_manifest(self.setup_id)
+                .await
+                .map_err(|_| FederationSetupHttpError::storage())?
+                .is_none(),
+        };
+        let certification = match certify {
             true => {
                 let manifest = FederationSetupManifest::certify(
                     proposal,
@@ -586,13 +619,18 @@ impl FederationSetupCoordinatorService {
             }
             false => None,
         };
+        if replay && certification.is_none() {
+            return Ok(approval);
+        }
         let mut transaction = Database::begin_transaction(&*self.database)
             .await
             .map_err(|_| FederationSetupHttpError::storage())?;
-        transaction
-            .add_federation_setup_approval(&approval)
-            .await
-            .map_err(|_| FederationSetupHttpError::storage())?;
+        if !replay {
+            transaction
+                .add_federation_setup_approval(&approval)
+                .await
+                .map_err(|_| FederationSetupHttpError::storage())?;
+        }
         if let Some((manifest, session, certified)) = certification {
             transaction
                 .store_federation_setup_manifest(&session, &certified, &manifest)
@@ -1701,6 +1739,150 @@ mod tests {
         assert_eq!(status.enrolled_members.len(), 3);
         assert_eq!(status.approved_members.len(), 3);
         assert_eq!(status.manifest_hash, Some(manifest.manifest_hash));
+
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn creator_approving_last_certifies_the_manifest() {
+        let fixture = setup_http_fixture(FederationSetupCoordinatorServiceConfig::default()).await;
+        let client = FederationSetupHttpClient::default();
+        for member in 2..=3 {
+            client
+                .enroll(fixture.invitation(member), fixture.enrollment(member))
+                .await
+                .expect("member enrollment");
+        }
+        let proposal = publish_proposal(&fixture).await;
+        let approval = |member: u16| {
+            FederationSetupApproval::sign(
+                &proposal,
+                member_id(member),
+                fixture
+                    .member_secrets
+                    .get(&member_id(member))
+                    .expect("secret"),
+                fixture.url_policy,
+            )
+            .expect("approval")
+        };
+        for member in 2..=3 {
+            client
+                .approve(fixture.invitation(member), &approval(member))
+                .await
+                .expect("member approval");
+        }
+        assert!(fixture
+            .database
+            .get_federation_setup_manifest(fixture.service.setup_id)
+            .await
+            .expect("manifest read")
+            .is_none());
+
+        let creator_approval = approval(1);
+        assert_eq!(
+            fixture
+                .service
+                .approve_local(creator_approval.clone())
+                .await
+                .expect("creator approval"),
+            creator_approval
+        );
+        let manifest = client
+            .manifest(fixture.invitation(2))
+            .await
+            .expect("certified manifest");
+        assert_eq!(manifest.approvals.len(), 3);
+        let status = fixture.service.local_status().await.expect("status");
+        assert_eq!(
+            status.coordinator_phase,
+            FederationSetupCoordinatorPhase::Certified
+        );
+        assert_eq!(status.manifest_hash, Some(manifest.manifest_hash));
+        assert_eq!(
+            fixture
+                .service
+                .approve_local(creator_approval.clone())
+                .await
+                .expect("exact creator replay"),
+            creator_approval
+        );
+        assert_eq!(
+            client
+                .manifest(fixture.invitation(2))
+                .await
+                .expect("unchanged manifest"),
+            manifest
+        );
+
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn approval_replay_certifies_a_complete_uncertified_set() {
+        let fixture = setup_http_fixture(FederationSetupCoordinatorServiceConfig::default()).await;
+        let client = FederationSetupHttpClient::default();
+        for member in 2..=3 {
+            client
+                .enroll(fixture.invitation(member), fixture.enrollment(member))
+                .await
+                .expect("member enrollment");
+        }
+        let proposal = publish_proposal(&fixture).await;
+        let approvals = (1..=3)
+            .map(|member| {
+                FederationSetupApproval::sign(
+                    &proposal,
+                    member_id(member),
+                    fixture
+                        .member_secrets
+                        .get(&member_id(member))
+                        .expect("secret"),
+                    fixture.url_policy,
+                )
+                .expect("approval")
+            })
+            .collect::<Vec<_>>();
+        // Every approval is stored without certification, as when the last one
+        // was written by another process.
+        let mut transaction = Database::begin_transaction(&*fixture.database)
+            .await
+            .expect("approval transaction");
+        for approval in &approvals {
+            transaction
+                .add_federation_setup_approval(approval)
+                .await
+                .expect("stored approval");
+        }
+        transaction.commit().await.expect("commit approvals");
+        assert_eq!(
+            fixture
+                .service
+                .local_status()
+                .await
+                .expect("uncertified status")
+                .coordinator_phase,
+            FederationSetupCoordinatorPhase::ProposalPublished
+        );
+
+        client
+            .approve(fixture.invitation(2), &approvals[1])
+            .await
+            .expect("exact member replay");
+        let manifest = client
+            .manifest(fixture.invitation(2))
+            .await
+            .expect("certified manifest");
+        assert_eq!(manifest.approvals.len(), 3);
+        assert_eq!(
+            fixture
+                .service
+                .local_status()
+                .await
+                .expect("certified status")
+                .coordinator_phase,
+            FederationSetupCoordinatorPhase::Certified
+        );
 
         fixture.stop().await;
     }

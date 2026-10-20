@@ -10,6 +10,11 @@
 # TRANSPORT=http (default) runs federation traffic over local HTTP. TRANSPORT=iroh
 # makes every member Iroh-only for enrollment, key generation, and consensus;
 # the management gRPC stays on localhost TCP either way.
+#
+# Operators in a GUI click in any order, so two switches change the order:
+# APPROVE_ORDER=creator-last approves members 2..N before the creator
+# (default creator-first), and ACTIVATE_EARLY=1 activates member 1 as soon as
+# its own status reports finalized_ready, before the others finish.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +31,8 @@ STATUS_SLEEP_SECONDS="${STATUS_SLEEP_SECONDS:-1}"
 BUILD="${BUILD:-1}"
 TRANSPORT="${TRANSPORT:-http}"
 IROH_PORT_START="${IROH_PORT_START:-$((PORT_START + 200))}"
+APPROVE_ORDER="${APPROVE_ORDER:-creator-first}"
+ACTIVATE_EARLY="${ACTIVATE_EARLY:-0}"
 PIDS=()
 
 die() {
@@ -219,11 +226,14 @@ wait_for_setup_rpc() {
     die "member $member setup RPC did not become reachable"
 }
 
+# Wait until every listed member (default: all) reports finalized_ready.
 wait_for_all_finalized() {
     local attempt member all_ready
+    local members=("$@")
+    ((${#members[@]} > 0)) || members=($(seq 1 "$MEMBERS"))
     for attempt in $(seq 1 "$STATUS_RETRIES"); do
         all_ready=true
-        for member in $(seq 1 "$MEMBERS"); do
+        for member in "${members[@]}"; do
             if ! setup_cli "$member" federation-setup status --json \
                 >"$(member_dir "$member")/status.json" 2>/dev/null; then
                 all_ready=false
@@ -235,7 +245,7 @@ wait_for_all_finalized() {
         [[ "$all_ready" == "true" ]] && return 0
         sleep "$STATUS_SLEEP_SECONDS"
     done
-    for member in $(seq 1 "$MEMBERS"); do
+    for member in "${members[@]}"; do
         printf 'member %s: %s\n' "$member" \
             "$(jq -c '{participant_phase, dkg: .dkg.phase, error: .dkg.error}' "$(member_dir "$member")/status.json" 2>/dev/null || echo unknown)" >&2
     done
@@ -257,6 +267,11 @@ wait_for_running_member() {
     die "member $member did not come back as a running federation member"
 }
 
+activate_member() {
+    setup_cli "$1" federation-setup activate >"$(member_dir "$1")/activate.log" \
+        2>"$(member_dir "$1")/activate-warning.log"
+}
+
 for command in cargo cmp curl jq openssl seq; do
     command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
@@ -264,6 +279,9 @@ done
 [[ "$THRESHOLD" =~ ^[1-9][0-9]*$ ]] || die "THRESHOLD must be positive"
 ((THRESHOLD <= MEMBERS)) || die "THRESHOLD cannot exceed MEMBERS"
 [[ "$TRANSPORT" == "http" || "$TRANSPORT" == "iroh" ]] || die "TRANSPORT must be http or iroh"
+[[ "$APPROVE_ORDER" == "creator-first" || "$APPROVE_ORDER" == "creator-last" ]] \
+    || die "APPROVE_ORDER must be creator-first or creator-last"
+[[ "$ACTIVATE_EARLY" == "0" || "$ACTIVATE_EARLY" == "1" ]] || die "ACTIVATE_EARLY must be 0 or 1"
 
 cd "$REPO_ROOT"
 if [[ "$BUILD" == "1" ]]; then
@@ -321,8 +339,12 @@ done
 setup_cli 1 federation-setup propose >"$(member_dir 1)/propose.log"
 proposal_hash="$(sed -n 's/^proposal_hash: //p' "$(member_dir 1)/propose.log")"
 [[ "$proposal_hash" =~ ^[0-9a-f]{64}$ ]] || die "proposal hash is invalid"
-printf 'Proposal %s; every member reviews and approves (creator first)...\n' "$proposal_hash"
-for member in $(seq 1 "$MEMBERS"); do
+case "$APPROVE_ORDER" in
+    creator-last) approve_order=($(seq 2 "$MEMBERS") 1) ;;
+    *) approve_order=($(seq 1 "$MEMBERS")) ;;
+esac
+printf 'Proposal %s; every member reviews and approves (%s)...\n' "$proposal_hash" "$APPROVE_ORDER"
+for member in "${approve_order[@]}"; do
     setup_cli "$member" federation-setup review --json >"$(member_dir "$member")/review.json"
     [[ "$(jq -r '.proposal_hash' "$(member_dir "$member")/review.json")" == "$proposal_hash" ]] \
         || die "member $member reviewed another proposal"
@@ -330,15 +352,21 @@ for member in $(seq 1 "$MEMBERS"); do
         >"$(member_dir "$member")/approve.log"
 done
 
-printf 'Waiting for key generation to finish on every member...\n'
 dkg_started_at="$SECONDS"
-wait_for_all_finalized
+activate_members=($(seq 1 "$MEMBERS"))
+if [[ "$ACTIVATE_EARLY" == "1" ]]; then
+    printf 'Activating member 1 as soon as it reports finalized_ready...\n'
+    wait_for_all_finalized 1
+    activate_member 1
+    activate_members=($(seq 2 "$MEMBERS"))
+fi
+printf 'Waiting for key generation to finish on members %s...\n' "${activate_members[*]}"
+wait_for_all_finalized "${activate_members[@]}"
 printf 'Key generation finished in %ss\n' "$((SECONDS - dkg_started_at))"
 
-printf 'Activating every member over gRPC...\n'
-for member in $(seq 1 "$MEMBERS"); do
-    setup_cli "$member" federation-setup activate >"$(member_dir "$member")/activate.log" \
-        2>"$(member_dir "$member")/activate-warning.log"
+printf 'Activating members %s over gRPC...\n' "${activate_members[*]}"
+for member in "${activate_members[@]}"; do
+    activate_member "$member"
 done
 for member in $(seq 1 "$MEMBERS"); do
     cmp -s "$(member_activated_dir 1)/federation-public.json" \

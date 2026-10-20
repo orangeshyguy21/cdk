@@ -760,13 +760,23 @@ impl FederationSetupProvider for SetupModeProvider {
         request: proto::ApproveProposalRequest,
     ) -> Result<proto::ApproveProposalResponse, FederationSetupError> {
         let mode = &self.mode;
-        let _workers = mode.workers.lock().await;
+        let mut workers = mode.workers.lock().await;
         let hash = FederationSetupProposalHash::from_str(request.proposal_hash.trim())
             .context("invalid proposal hash")
             .map_err(invalid_argument)?;
+        let config = mode.require_local_config().map_err(failed_precondition)?;
+        // The creator records its approval through the mounted coordinator, so
+        // it is serialized with members' approvals and certifies if it is last.
+        if matches!(
+            config.local_role(),
+            FederationSetupLocalRole::Coordinator { .. }
+        ) {
+            mode.ensure_coordinator(&mut workers).map_err(internal)?;
+        }
         let approval = approve_setup(
             mode.database.as_ref(),
             &mode.coordinator_client,
+            workers.coordinator.as_deref(),
             &mode.config_path,
             hash,
             current_unix_time().map_err(internal)?,
