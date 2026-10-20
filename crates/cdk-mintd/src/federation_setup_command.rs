@@ -837,7 +837,11 @@ async fn build_certified_dkg_mint(
     let [keyset_spec] = handoff.manifest.keyset_specs() else {
         bail!("setup-only DKG requires exactly one manifest keyset policy");
     };
-    let mut builder = cdk::mint::MintBuilder::new(database).with_federation_config(runtime_config);
+    // Stay on the setup config even if every activation is already stored, so a
+    // restarted member resumes its DKG driver and completes the ceremony.
+    let mut builder = cdk::mint::MintBuilder::new(database)
+        .with_federation_config(runtime_config)
+        .without_federation_dkg_record_activation();
     builder
         .configure_unit(
             keyset_spec.unit.clone(),

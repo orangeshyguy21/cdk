@@ -244,13 +244,23 @@ pub struct FederationDkgDriverTickOutcome {
     pub failed_deliveries: usize,
     /// Configured receivers with at least one failed delivery.
     pub failed_members: Vec<MemberId>,
+    /// Whether every member has acknowledged this member's final-config
+    /// confirmation during this driver run.
+    pub activation_delivered: bool,
 }
 
 impl FederationDkgDriverTickOutcome {
-    /// Whether the durable local view contains a complete, verified ceremony.
+    /// Whether the durable local view contains a complete, verified ceremony
+    /// and every member has acknowledged this member's confirmation.
+    ///
+    /// Holding every confirmation locally is not enough: peers only receive
+    /// this member's confirmation from its own driver, so a driver that resumes
+    /// after a restart must deliver it again before it can complete.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.phase_after == FederationDkgDriverPhase::Complete && self.failed_deliveries == 0
+        self.phase_after == FederationDkgDriverPhase::Complete
+            && self.failed_deliveries == 0
+            && self.activation_delivered
     }
 }
 
@@ -1345,6 +1355,13 @@ where
     } else {
         next_plan.phase
     };
+    let activation_delivered = plan.activation.as_ref().is_some_and(|request| {
+        broadcast_acknowledged_by_all(
+            &delivery_tracker.activation,
+            request,
+            public_config.members.keys().copied(),
+        )
+    });
     Ok(FederationDkgDriverTickOutcome {
         phase_before,
         phase_after,
@@ -1353,6 +1370,7 @@ where
         successful_deliveries: delivery.successful,
         failed_deliveries: delivery.failed,
         failed_members: delivery.failed_members.into_iter().collect(),
+        activation_delivered,
     })
 }
 
@@ -2287,6 +2305,7 @@ mod tests {
             successful_deliveries: 2,
             failed_deliveries: 1,
             failed_members: vec![MemberId::new(3).expect("member")],
+            activation_delivered: false,
         };
         let second = FederationDkgDriverTickOutcome {
             phase_before: FederationDkgDriverPhase::Commitment,
@@ -2296,6 +2315,7 @@ mod tests {
             successful_deliveries: 1,
             failed_deliveries: 0,
             failed_members: Vec::new(),
+            activation_delivered: false,
         };
 
         let mut totals = FederationDkgDeliveryTotals::default();

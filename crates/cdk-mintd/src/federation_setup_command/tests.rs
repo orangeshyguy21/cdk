@@ -549,6 +549,9 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
     let creator_dkg_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("creator DKG listener");
+    let creator_dkg_address = creator_dkg_listener
+        .local_addr()
+        .expect("creator DKG address");
     let member_two_dkg_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("member two DKG listener");
@@ -983,6 +986,50 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
             .expect_err("activation must wait for every member to receive the confirmation");
         assert!(error.to_string().contains("every member has received"));
     }
+
+    // Restart the creator's setup DKG while it holds every confirmation but its
+    // own has not reached member three. It must resume its driver rather than
+    // switch to the final config, or its ceremony never completes.
+    let (restart_sender, restart_receiver) = oneshot::channel();
+    let _ = std::mem::replace(&mut dkg_shutdown_senders[0], restart_sender).send(());
+    dkg_servers
+        .remove(0)
+        .await
+        .expect("creator DKG server stops for restart");
+    let restarted_mint = build_certified_dkg_mint(databases[0].clone(), &handoffs[0])
+        .await
+        .expect("restarted setup-only DKG mint");
+    let restarted_router = cdk_axum::create_federation_dkg_setup_router(
+        Arc::new(restarted_mint),
+        cdk_axum::FederationPeerSyncConfig::default(),
+        cdk_axum::FederationDkgAutoStartConfig::from_manifest(
+            &handoffs[0].manifest,
+            handoffs[0].url_policy,
+            cdk_axum::FederationDkgDriverRunConfig {
+                max_ticks: 2_000,
+                retry_delay: std::time::Duration::from_millis(10),
+                ..cdk_axum::FederationDkgDriverRunConfig::default()
+            },
+        )
+        .expect("restarted manifest DKG auto-start"),
+    )
+    .await
+    .expect("restarted setup-only DKG router");
+    let restarted_listener = tokio::net::TcpListener::bind(creator_dkg_address)
+        .await
+        .expect("rebind creator DKG listener");
+    dkg_servers.insert(
+        0,
+        tokio::spawn(async move {
+            axum::serve(restarted_listener, restarted_router)
+                .with_graceful_shutdown(async {
+                    let _ = restart_receiver.await;
+                })
+                .await
+                .expect("restarted DKG server");
+        }),
+    );
+
     hold_confirmations.store(false, Ordering::SeqCst);
 
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
