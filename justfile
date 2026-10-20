@@ -1489,6 +1489,26 @@ fed-regtest-setup dir="target/cdk-fed-regtest-setup" members="5" threshold="3" p
     CDK_MINTD_BIN=target/debug/cdk-mintd \
     bash scripts/run_test_federation_dkg.sh
 
+# Set up and run a federation driven only through the management gRPC (setup mode).
+fed-setup-grpc members="4" threshold="3" port_start="31885":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ ! -f Cargo.toml ]; then
+    cd {{invocation_directory()}}
+  fi
+  MEMBERS="{{members}}" THRESHOLD="{{threshold}}" PORT_START="{{port_start}}" \
+    bash scripts/run_federation_setup_grpc.sh
+
+# Same as fed-setup-grpc, with every member Iroh-only for federation traffic.
+fed-setup-grpc-iroh members="4" threshold="3" port_start="32885":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ ! -f Cargo.toml ]; then
+    cd {{invocation_directory()}}
+  fi
+  TRANSPORT=iroh MEMBERS="{{members}}" THRESHOLD="{{threshold}}" PORT_START="{{port_start}}" \
+    bash scripts/run_federation_setup_grpc.sh
+
 # Run the bounded, in-memory dealer-free DKG phase benchmark
 dkg-perf profile="5-of-3" denominations="one" iterations="3" build="release" phases="all" timeout_secs="300" full_ceremony="0":
   #!/usr/bin/env bash
