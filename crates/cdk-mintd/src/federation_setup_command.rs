@@ -68,43 +68,7 @@ pub(crate) async fn run_setup_command(
 ) -> Result<()> {
     match &args.command {
         cli::FederationSetupCommand::Create(args) => {
-            let thresholds = ThresholdParams::with_bft_consensus(args.members, args.threshold)
-                .context("invalid federation threshold profile")?;
-            let payment_threshold = args
-                .payment_observation_threshold
-                .unwrap_or(thresholds.consensus_threshold);
-            let network = setup_network(args.network);
-            let spec = FederationSetupCreateSpec {
-                threshold_params: thresholds,
-                public_mint_url: parse_mint_url(&args.public_mint_url, "public mint URL")?,
-                federation_api_url: parse_mint_url(&args.federation_api_url, "federation API URL")?,
-                coordinator_url: parse_mint_url(&args.coordinator_url, "coordinator URL")?,
-                network,
-                payment_observation_policy: FederationPaymentObservationPolicy::member_quorum(
-                    payment_threshold,
-                ),
-                checkpoint_policy: FederationCheckpointPolicy {
-                    checkpoint_interval_journal_operations: args
-                        .checkpoint_interval_journal_operations,
-                    checkpoint_interval_finalized_items: args.checkpoint_interval_finalized_items,
-                    checkpoint_interval_canonical_bytes: args.checkpoint_interval_canonical_bytes,
-                },
-                keysets: vec![FederationDkgKeysetSpec::new(
-                    CurrencyUnit::from_str(&args.unit).context("invalid setup currency unit")?,
-                    true,
-                    args.input_fee_ppk,
-                    args.final_expiry,
-                    args.amounts
-                        .iter()
-                        .copied()
-                        .map(Amount::from)
-                        .collect::<BTreeSet<_>>(),
-                )
-                .context("invalid setup keyset")?],
-                frost: setup_frost_policy(args, network)?,
-                invitation_lifetime_secs: args.invitation_lifetime_seconds,
-                url_policy: setup_url_policy(args.allow_insecure_localhost),
-            };
+            let spec = FederationSetupCreateParams::from_cli(args)?.to_spec()?;
             let db = cdk_sqlite::MintSqliteDatabase::new(args.database.clone())
                 .await
                 .context("failed to open federation setup database")?;
@@ -254,42 +218,201 @@ pub(crate) async fn run_setup_command(
     Ok(())
 }
 
+/// Default BLS keyset denominations for a new federation setup.
 #[cfg(feature = "sqlite")]
-fn setup_frost_policy(
-    args: &cli::FederationSetupCreateArgs,
-    network: FederationSetupBitcoinNetwork,
-) -> Result<FederationSetupFrostPolicy> {
+#[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+pub(crate) const DEFAULT_SETUP_AMOUNTS: [u64; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// Default invitation lifetime for a new federation setup.
+#[cfg(feature = "sqlite")]
+#[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+pub(crate) const DEFAULT_SETUP_INVITATION_LIFETIME_SECS: u64 = 86_400;
+
+/// Plain inputs for creating a federation setup, shared by the CLI and the setup RPC.
+#[cfg(feature = "sqlite")]
+#[cfg_attr(not(feature = "federation-bdk"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct FederationSetupCreateParams {
+    pub(crate) members: u16,
+    pub(crate) threshold: u16,
+    pub(crate) payment_observation_threshold: Option<u16>,
+    pub(crate) network: FederationSetupBitcoinNetwork,
+    pub(crate) public_mint_url: MintUrl,
+    pub(crate) federation_api_url: MintUrl,
+    pub(crate) coordinator_url: MintUrl,
+    pub(crate) checkpoint_interval_journal_operations: u64,
+    pub(crate) checkpoint_interval_finalized_items: u64,
+    pub(crate) checkpoint_interval_canonical_bytes: u64,
+    pub(crate) invitation_lifetime_secs: u64,
+    pub(crate) unit: String,
+    pub(crate) amounts: Vec<u64>,
+    pub(crate) input_fee_ppk: u64,
+    pub(crate) final_expiry: Option<u64>,
+    pub(crate) frost_root_key_epoch: u64,
+    pub(crate) frost_application_key_epoch: u64,
+    pub(crate) frost_minimum_confirmations: u32,
+    pub(crate) frost_fee_policy_version: u16,
+    pub(crate) bark: Option<FederationSetupBarkParams>,
+    pub(crate) allow_insecure_localhost: bool,
+}
+
+/// Optional Bark application inputs for a new federation setup.
+#[cfg(feature = "sqlite")]
+#[cfg_attr(not(feature = "federation-bark"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct FederationSetupBarkParams {
+    pub(crate) ark_server_public_key: String,
+    pub(crate) application_key_epoch: u64,
+    pub(crate) policy_config_path: PathBuf,
+}
+
+#[cfg(feature = "sqlite")]
+impl FederationSetupCreateParams {
+    /// Inputs with the same defaults as `cdk-mintd federation setup create`.
+    #[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+    pub(crate) fn with_defaults(
+        members: u16,
+        threshold: u16,
+        network: FederationSetupBitcoinNetwork,
+        public_mint_url: MintUrl,
+        federation_api_url: MintUrl,
+        coordinator_url: MintUrl,
+    ) -> Self {
+        Self {
+            members,
+            threshold,
+            payment_observation_threshold: None,
+            network,
+            public_mint_url,
+            federation_api_url,
+            coordinator_url,
+            checkpoint_interval_journal_operations:
+                cdk_common::federation::DEFAULT_CHECKPOINT_INTERVAL_JOURNAL_OPERATIONS,
+            checkpoint_interval_finalized_items:
+                cdk_common::federation::DEFAULT_CHECKPOINT_INTERVAL_FINALIZED_ITEMS,
+            checkpoint_interval_canonical_bytes:
+                cdk_common::federation::DEFAULT_CHECKPOINT_INTERVAL_CANONICAL_BYTES,
+            invitation_lifetime_secs: DEFAULT_SETUP_INVITATION_LIFETIME_SECS,
+            unit: "sat".to_string(),
+            amounts: DEFAULT_SETUP_AMOUNTS.to_vec(),
+            input_fee_ppk: 0,
+            final_expiry: None,
+            frost_root_key_epoch: 1,
+            frost_application_key_epoch: 1,
+            frost_minimum_confirmations: 1,
+            frost_fee_policy_version: 1,
+            bark: None,
+            allow_insecure_localhost: false,
+        }
+    }
+
+    fn from_cli(args: &cli::FederationSetupCreateArgs) -> Result<Self> {
+        let bark = match (
+            args.frost_bark_ark_server_public_key.as_deref(),
+            args.frost_bark_application_key_epoch,
+            args.frost_bark_policy_config.as_deref(),
+        ) {
+            (None, None, None) => None,
+            (Some(ark_server_public_key), Some(application_key_epoch), Some(policy_path)) => {
+                Some(FederationSetupBarkParams {
+                    ark_server_public_key: ark_server_public_key.to_string(),
+                    application_key_epoch,
+                    policy_config_path: policy_path.to_path_buf(),
+                })
+            }
+            _ => bail!(
+                "setup Bark policy requires --frost-bark-ark-server-public-key, \
+                 --frost-bark-application-key-epoch, and --frost-bark-policy-config together"
+            ),
+        };
+        Ok(Self {
+            members: args.members,
+            threshold: args.threshold,
+            payment_observation_threshold: args.payment_observation_threshold,
+            network: setup_network(args.network),
+            public_mint_url: parse_mint_url(&args.public_mint_url, "public mint URL")?,
+            federation_api_url: parse_mint_url(&args.federation_api_url, "federation API URL")?,
+            coordinator_url: parse_mint_url(&args.coordinator_url, "coordinator URL")?,
+            checkpoint_interval_journal_operations: args.checkpoint_interval_journal_operations,
+            checkpoint_interval_finalized_items: args.checkpoint_interval_finalized_items,
+            checkpoint_interval_canonical_bytes: args.checkpoint_interval_canonical_bytes,
+            invitation_lifetime_secs: args.invitation_lifetime_seconds,
+            unit: args.unit.clone(),
+            amounts: args.amounts.clone(),
+            input_fee_ppk: args.input_fee_ppk,
+            final_expiry: args.final_expiry,
+            frost_root_key_epoch: args.frost_root_key_epoch,
+            frost_application_key_epoch: args.frost_application_key_epoch,
+            frost_minimum_confirmations: args.frost_minimum_confirmations,
+            frost_fee_policy_version: args.frost_fee_policy_version,
+            bark,
+            allow_insecure_localhost: args.allow_insecure_localhost,
+        })
+    }
+
+    /// Build the validated-at-create setup specification.
+    pub(crate) fn to_spec(&self) -> Result<FederationSetupCreateSpec> {
+        let thresholds = ThresholdParams::with_bft_consensus(self.members, self.threshold)
+            .context("invalid federation threshold profile")?;
+        let payment_threshold = self
+            .payment_observation_threshold
+            .unwrap_or(thresholds.consensus_threshold);
+        Ok(FederationSetupCreateSpec {
+            threshold_params: thresholds,
+            public_mint_url: self.public_mint_url.clone(),
+            federation_api_url: self.federation_api_url.clone(),
+            coordinator_url: self.coordinator_url.clone(),
+            network: self.network,
+            payment_observation_policy: FederationPaymentObservationPolicy::member_quorum(
+                payment_threshold,
+            ),
+            checkpoint_policy: FederationCheckpointPolicy {
+                checkpoint_interval_journal_operations: self.checkpoint_interval_journal_operations,
+                checkpoint_interval_finalized_items: self.checkpoint_interval_finalized_items,
+                checkpoint_interval_canonical_bytes: self.checkpoint_interval_canonical_bytes,
+            },
+            keysets: vec![FederationDkgKeysetSpec::new(
+                CurrencyUnit::from_str(&self.unit).context("invalid setup currency unit")?,
+                true,
+                self.input_fee_ppk,
+                self.final_expiry,
+                self.amounts
+                    .iter()
+                    .copied()
+                    .map(Amount::from)
+                    .collect::<BTreeSet<_>>(),
+            )
+            .context("invalid setup keyset")?],
+            frost: setup_frost_policy(self)?,
+            invitation_lifetime_secs: self.invitation_lifetime_secs,
+            url_policy: setup_url_policy(self.allow_insecure_localhost),
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn setup_frost_policy(params: &FederationSetupCreateParams) -> Result<FederationSetupFrostPolicy> {
+    let network = params.network;
     let applications = vec![
         #[cfg(feature = "federation-bdk")]
         FederationSetupFrostApplication::CdkOnchain {
-            application_key_epoch: args.frost_application_key_epoch,
+            application_key_epoch: params.frost_application_key_epoch,
             confirmation_policy_version: 1,
-            minimum_confirmations: args.frost_minimum_confirmations,
-            fee_policy_version: args.frost_fee_policy_version,
+            minimum_confirmations: params.frost_minimum_confirmations,
+            fee_policy_version: params.frost_fee_policy_version,
         },
     ];
     #[cfg(feature = "federation-bark")]
     let mut applications = applications;
-    let bark = match (
-        args.frost_bark_ark_server_public_key.as_deref(),
-        args.frost_bark_application_key_epoch,
-        args.frost_bark_policy_config.as_deref(),
-    ) {
-        (None, None, None) => None,
-        (Some(ark_server_public_key), Some(application_key_epoch), Some(policy_path)) => {
-            Some((ark_server_public_key, application_key_epoch, policy_path))
-        }
-        _ => bail!(
-            "setup Bark policy requires --frost-bark-ark-server-public-key, \
-             --frost-bark-application-key-epoch, and --frost-bark-policy-config together"
-        ),
-    };
     #[cfg(feature = "federation-bark")]
-    if let Some((ark_server_public_key, application_key_epoch, policy_path)) = bark {
-        let ark_server_public_key = PublicKey::from_str(ark_server_public_key)
+    if let Some(bark) = params.bark.as_ref() {
+        let application_key_epoch = bark.application_key_epoch;
+        let ark_server_public_key = PublicKey::from_str(&bark.ark_server_public_key)
             .context("invalid compressed Ark server public key")?;
-        let policy: cdk_federation_bark::FederationBarkPolicyConfig =
-            crate::read_federation_json(policy_path, "federation setup Bark public policy config")?;
+        let policy: cdk_federation_bark::FederationBarkPolicyConfig = crate::read_federation_json(
+            &bark.policy_config_path,
+            "federation setup Bark public policy config",
+        )?;
         applications.push(cdk_federation_bark::federation_bark_setup_application(
             cdk_federation_bark::FederationBarkSetupConfig {
                 application_key_epoch,
@@ -303,17 +426,17 @@ fn setup_frost_policy(
                 cdk_federation_bark::FederationBarkRecoverySetupConfig {
                     application_key_epoch,
                     network: network.bitcoin_network(),
-                    minimum_confirmations: args.frost_minimum_confirmations,
-                    fee_policy_version: args.frost_fee_policy_version,
+                    minimum_confirmations: params.frost_minimum_confirmations,
+                    fee_policy_version: params.frost_fee_policy_version,
                 },
             )?,
         );
     }
     #[cfg(not(feature = "federation-bark"))]
-    if bark.is_some() {
+    if params.bark.is_some() {
         bail!("setup Bark policy requires the `federation-bark` feature");
     }
-    FederationSetupFrostPolicy::new(args.frost_root_key_epoch, applications, network)
+    FederationSetupFrostPolicy::new(params.frost_root_key_epoch, applications, network)
         .context("invalid setup FROST policy")
 }
 
@@ -327,11 +450,12 @@ pub(crate) async fn run_setup_command(
 
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Default)]
-struct HttpSetupCoordinator(cdk_axum::FederationSetupHttpClient);
+pub(crate) struct HttpSetupCoordinator(pub(crate) cdk_axum::FederationSetupHttpClient);
 
 #[cfg(feature = "sqlite")]
 impl HttpSetupCoordinator {
-    fn new(transport: cdk_axum::FederationTransport) -> Self {
+    /// Build a coordinator client that dials over Iroh when `transport` carries a node.
+    pub(crate) fn new(transport: cdk_axum::FederationTransport) -> Self {
         #[cfg(feature = "iroh")]
         if let Some(node) = transport.runtime_node() {
             return Self(cdk_axum::FederationSetupHttpClient::with_iroh_node(node));
@@ -377,19 +501,20 @@ impl FederationSetupCoordinator for HttpSetupCoordinator {
     }
 }
 
+/// Setup coordinator routes plus the service that owns their background work.
 #[cfg(feature = "sqlite")]
-async fn serve_setup_coordinator(
+pub(crate) struct SetupCoordinatorRouter {
+    pub(crate) router: axum::Router,
+    pub(crate) service: Arc<cdk_axum::FederationSetupCoordinatorService>,
+}
+
+/// Build the creator's enrollment, proposal, and approval routes over `database`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn build_setup_coordinator_router(
+    database: cdk_common::database::DynMintDatabase,
     config_path: &Path,
-    listen: std::net::SocketAddr,
-    driver: cdk_axum::FederationDkgDriverRunConfig,
-    transport: cdk_axum::FederationTransport,
-    http_enabled: bool,
-) -> Result<()> {
-    let now_unix = current_unix_time()?;
-    let (config, secrets) = load_local_state(config_path, now_unix)?;
-    if config.manifest_path().exists() {
-        return serve_certified_dkg(config_path, listen, driver, transport, http_enabled).await;
-    }
+) -> Result<SetupCoordinatorRouter> {
+    let (config, secrets) = load_local_state(config_path, current_unix_time()?)?;
     let draft = config
         .coordinator
         .as_ref()
@@ -398,11 +523,6 @@ async fn serve_setup_coordinator(
         .coordinator_secret_key
         .clone()
         .ok_or_else(|| anyhow!("protected setup coordinator identity is missing"))?;
-    let database = Arc::new(
-        cdk_sqlite::MintSqliteDatabase::new(config.database_path().to_path_buf())
-            .await
-            .context("failed to open federation setup database")?,
-    );
     let service = Arc::new(
         cdk_axum::FederationSetupCoordinatorService::new(
             database,
@@ -415,6 +535,84 @@ async fn serve_setup_coordinator(
         .context("failed to initialize setup coordinator service")?,
     );
     let router = cdk_axum::create_federation_setup_router(service.clone());
+    Ok(SetupCoordinatorRouter { router, service })
+}
+
+/// Setup-only DKG routes plus their not-yet-started background services.
+#[cfg(feature = "sqlite")]
+pub(crate) struct SetupDkgRouter {
+    pub(crate) router: axum::Router,
+    pub(crate) services: Option<cdk_axum::FederationServices>,
+    pub(crate) setup_id: FederationSetupId,
+    pub(crate) member_id: MemberId,
+    pub(crate) ceremony_id: String,
+}
+
+/// Build the certified member's setup-only DKG routes over `database`.
+///
+/// Registers the manifest ceremony, which moves the local setup into `dkg_running`.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn build_certified_dkg_router(
+    database: cdk_common::database::DynMintDatabase,
+    config_path: &Path,
+    driver: cdk_axum::FederationDkgDriverRunConfig,
+    transport: cdk_axum::FederationTransport,
+) -> Result<SetupDkgRouter> {
+    let handoff = load_certified_dkg_handoff(config_path)?;
+    let mint = build_certified_dkg_mint(database.clone(), &handoff).await?;
+    let auto_start = cdk_axum::FederationDkgAutoStartConfig::from_manifest(
+        &handoff.manifest,
+        handoff.url_policy,
+        driver,
+    )
+    .context("certified manifest cannot start DKG")?;
+    let member_id = handoff.private_config.member_id;
+    let ceremony_id = auto_start.ceremony_id().to_string();
+    register_manifest_dkg_ceremony(&database, &handoff, &auto_start).await?;
+    let (router, services) = cdk_axum::prepare_federation_dkg_setup_router_with_transport(
+        Arc::new(mint),
+        cdk_axum::FederationPeerSyncConfig::default(),
+        auto_start,
+        transport,
+    )
+    .await
+    .context("failed to create setup-only DKG router")?;
+    Ok(SetupDkgRouter {
+        router,
+        services,
+        setup_id: handoff.manifest.proposal.body.setup_id,
+        member_id,
+        ceremony_id,
+    })
+}
+
+#[cfg(feature = "sqlite")]
+async fn ctrl_c_shutdown() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("setup listener shutdown signal failed")
+}
+
+#[cfg(feature = "sqlite")]
+async fn serve_setup_coordinator(
+    config_path: &Path,
+    listen: std::net::SocketAddr,
+    driver: cdk_axum::FederationDkgDriverRunConfig,
+    transport: cdk_axum::FederationTransport,
+    http_enabled: bool,
+) -> Result<()> {
+    let now_unix = current_unix_time()?;
+    let (config, _) = load_local_state(config_path, now_unix)?;
+    if config.manifest_path().exists() {
+        return serve_certified_dkg(config_path, listen, driver, transport, http_enabled).await;
+    }
+    let database: cdk_common::database::DynMintDatabase = Arc::new(
+        cdk_sqlite::MintSqliteDatabase::new(config.database_path().to_path_buf())
+            .await
+            .context("failed to open federation setup database")?,
+    );
+    let SetupCoordinatorRouter { router, service } =
+        build_setup_coordinator_router(database, config_path)?;
     let listener = if http_enabled {
         Some(
             tokio::net::TcpListener::bind(listen)
@@ -429,8 +627,14 @@ async fn serve_setup_coordinator(
         true => println!("setup_only_listen: {listen}"),
         false => println!("setup_only_listen: disabled"),
     }
-    let result =
-        serve_setup_router(listener, router, transport, "setup-only coordinator server").await;
+    let result = serve_setup_router(
+        listener,
+        router,
+        transport,
+        "setup-only coordinator server",
+        ctrl_c_shutdown(),
+    )
+    .await;
     service.shutdown().await;
     result
 }
@@ -443,31 +647,27 @@ async fn serve_certified_dkg(
     transport: cdk_axum::FederationTransport,
     http_enabled: bool,
 ) -> Result<()> {
-    let handoff = load_certified_dkg_handoff(config_path)?;
-    let database = Arc::new(
+    let database: cdk_common::database::DynMintDatabase = Arc::new(
         cdk_sqlite::MintSqliteDatabase::new(read_local_config(config_path)?.database_path)
             .await
             .context("failed to open certified DKG database")?,
     );
-    let mint = build_certified_dkg_mint(database.clone(), &handoff).await?;
-    let auto_start = cdk_axum::FederationDkgAutoStartConfig::from_manifest(
-        &handoff.manifest,
-        handoff.url_policy,
-        driver,
-    )
-    .context("certified manifest cannot start DKG")?;
-    let member_id = handoff.private_config.member_id;
-    let ceremony_id = auto_start.ceremony_id();
-    let mint_database: cdk_common::database::DynMintDatabase = database.clone();
-    register_manifest_dkg_ceremony(&mint_database, &handoff, &auto_start).await?;
-    let router = cdk_axum::create_federation_dkg_setup_router_with_transport(
-        Arc::new(mint),
-        cdk_axum::FederationPeerSyncConfig::default(),
-        auto_start,
-        transport.clone(),
-    )
-    .await
-    .context("failed to create setup-only DKG router")?;
+    let SetupDkgRouter {
+        router,
+        services,
+        setup_id,
+        member_id,
+        ceremony_id,
+    } = build_certified_dkg_router(database, config_path, driver, transport.clone()).await?;
+    let running = match services {
+        Some(services) => Some(
+            services
+                .start()
+                .await
+                .context("failed to start setup-only DKG services")?,
+        ),
+        None => None,
+    };
     let listener = if http_enabled {
         Some(
             tokio::net::TcpListener::bind(listen)
@@ -477,23 +677,42 @@ async fn serve_certified_dkg(
     } else {
         None
     };
-    println!("setup_id: {}", handoff.manifest.proposal.body.setup_id);
+    println!("setup_id: {setup_id}");
     println!("member_id: {member_id}");
     println!("ceremony_id: {ceremony_id}");
     match http_enabled {
         true => println!("dkg_only_listen: {listen}"),
         false => println!("dkg_only_listen: disabled"),
     }
-    serve_setup_router(listener, router, transport, "setup-only DKG server").await
+    let result = serve_setup_router(
+        listener,
+        router,
+        transport,
+        "setup-only DKG server",
+        ctrl_c_shutdown(),
+    )
+    .await;
+    if let Some(running) = running {
+        if let Err(error) = running.shutdown().await {
+            tracing::warn!(%error, "Setup-only DKG services did not shut down cleanly");
+        }
+    }
+    result
 }
 
+/// Serve setup routes over HTTP and/or Iroh until `shutdown` resolves or a listener fails.
 #[cfg(feature = "sqlite")]
-async fn serve_setup_router(
+pub(crate) async fn serve_setup_router<S>(
     listener: Option<tokio::net::TcpListener>,
     router: axum::Router,
     transport: cdk_axum::FederationTransport,
     context: &'static str,
-) -> Result<()> {
+    shutdown: S,
+) -> Result<()>
+where
+    S: std::future::Future<Output = Result<()>> + Send,
+{
+    tokio::pin!(shutdown);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
     let mut http_task = listener.map(|listener| {
         let http_router = router.clone();
@@ -520,8 +739,8 @@ async fn serve_setup_router(
     let early_exit = match (http_task.as_mut(), iroh_server.as_ref()) {
         (Some(http_task), Some(server)) => {
             tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    signal.context("setup listener shutdown signal failed")?;
+                signal = &mut shutdown => {
+                    signal?;
                     None
                 }
                 result = http_task => Some(result.context("setup HTTP listener task failed")?.context(context)),
@@ -530,8 +749,8 @@ async fn serve_setup_router(
         }
         (Some(http_task), None) => {
             tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    signal.context("setup listener shutdown signal failed")?;
+                signal = &mut shutdown => {
+                    signal?;
                     None
                 }
                 result = http_task => Some(result.context("setup HTTP listener task failed")?.context(context)),
@@ -539,8 +758,8 @@ async fn serve_setup_router(
         }
         (None, Some(server)) => {
             tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    signal.context("setup listener shutdown signal failed")?;
+                signal = &mut shutdown => {
+                    signal?;
                     None
                 }
                 () = server.finished() => Some(Err(anyhow!("{context} Iroh listener exited unexpectedly"))),
@@ -551,8 +770,8 @@ async fn serve_setup_router(
     #[cfg(not(feature = "iroh"))]
     let early_exit = match http_task.as_mut() {
         Some(http_task) => tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("setup listener shutdown signal failed")?;
+            signal = &mut shutdown => {
+                signal?;
                 None
             }
             result = http_task => Some(result.context("setup HTTP listener task failed")?.context(context)),
@@ -584,7 +803,7 @@ async fn serve_setup_router(
 
 #[cfg(feature = "sqlite")]
 async fn build_certified_dkg_mint(
-    database: Arc<cdk_sqlite::MintSqliteDatabase>,
+    database: cdk_common::database::DynMintDatabase,
     handoff: &FederationSetupDkgHandoff,
 ) -> Result<cdk::mint::Mint> {
     let runtime_config = cdk::mint::FederationRuntimeConfig::new(
@@ -741,13 +960,24 @@ async fn setup_status_with_client(
     config_path: &Path,
     client: &cdk_axum::FederationSetupHttpClient,
 ) -> Result<FederationSetupCommandStatus> {
-    let now_unix = current_unix_time()?;
-    let (config, secrets) = load_local_state(config_path, now_unix)?;
-    let database = Arc::new(
+    let config = read_local_config(config_path)?;
+    let database: cdk_common::database::DynMintDatabase = Arc::new(
         cdk_sqlite::MintSqliteDatabase::new(config.database_path().to_path_buf())
             .await
             .context("failed to open federation setup database")?,
     );
+    setup_status_with_db(database, config_path, client).await
+}
+
+/// Read local setup progress, fetching and persisting the certified manifest once available.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn setup_status_with_db(
+    database: cdk_common::database::DynMintDatabase,
+    config_path: &Path,
+    client: &cdk_axum::FederationSetupHttpClient,
+) -> Result<FederationSetupCommandStatus> {
+    let now_unix = current_unix_time()?;
+    let (config, secrets) = load_local_state(config_path, now_unix)?;
     let manifest = database
         .get_federation_setup_manifest(config.setup_id)
         .await
@@ -815,26 +1045,26 @@ async fn setup_status_with_client(
 
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct FederationSetupCommandStatus {
-    version: u16,
-    setup_id: FederationSetupId,
-    member_id: MemberId,
-    participant_phase: String,
-    coordinator_phase: Option<String>,
-    member_count: u16,
-    enrolled_members: Vec<MemberId>,
-    missing_enrollments: Vec<MemberId>,
-    approved_members: Vec<MemberId>,
-    missing_approvals: Vec<MemberId>,
-    proposal_hash: Option<String>,
-    manifest_hash: Option<String>,
-    dkg: Option<crate::federation_dkg_status::FederationSetupDkgProgress>,
-    activation: Option<FederationSetupActivation>,
+pub(crate) struct FederationSetupCommandStatus {
+    pub(crate) version: u16,
+    pub(crate) setup_id: FederationSetupId,
+    pub(crate) member_id: MemberId,
+    pub(crate) participant_phase: String,
+    pub(crate) coordinator_phase: Option<String>,
+    pub(crate) member_count: u16,
+    pub(crate) enrolled_members: Vec<MemberId>,
+    pub(crate) missing_enrollments: Vec<MemberId>,
+    pub(crate) approved_members: Vec<MemberId>,
+    pub(crate) missing_approvals: Vec<MemberId>,
+    pub(crate) proposal_hash: Option<String>,
+    pub(crate) manifest_hash: Option<String>,
+    pub(crate) dkg: Option<crate::federation_dkg_status::FederationSetupDkgProgress>,
+    pub(crate) activation: Option<FederationSetupActivation>,
 }
 
 #[cfg(feature = "sqlite")]
 async fn build_setup_command_status(
-    database: Arc<cdk_sqlite::MintSqliteDatabase>,
+    database: cdk_common::database::DynMintDatabase,
     config: &FederationSetupLocalConfig,
     bootstrap_status: Option<cdk_common::federation::FederationSetupStatus>,
     now_unix: u64,
@@ -1004,13 +1234,13 @@ fn display_setup_members(members: &[MemberId]) -> String {
 
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FederationSetupActivationResult {
-    setup_id: FederationSetupId,
-    member_id: MemberId,
-    federation_id: cdk_common::federation::FederationId,
-    final_config_digest: FederationConfigDigest,
-    public_config_path: PathBuf,
-    private_config_path: PathBuf,
+pub(crate) struct FederationSetupActivationResult {
+    pub(crate) setup_id: FederationSetupId,
+    pub(crate) member_id: MemberId,
+    pub(crate) federation_id: cdk_common::federation::FederationId,
+    pub(crate) final_config_digest: FederationConfigDigest,
+    pub(crate) public_config_path: PathBuf,
+    pub(crate) private_config_path: PathBuf,
 }
 
 #[cfg(feature = "sqlite")]
@@ -1051,15 +1281,51 @@ async fn activate_setup_with_faults(
     activation_fault: SetupActivationFault,
 ) -> Result<FederationSetupActivationResult> {
     let config = read_local_config(config_path)?;
-    let handoff = load_certified_dkg_handoff_from_state(&config, now_unix)?;
-    let database = Arc::new(
+    let database: cdk_common::database::DynMintDatabase = Arc::new(
         cdk_sqlite::MintSqliteDatabase::new(config.database_path().to_path_buf())
             .await
             .context("failed to open setup database for activation")?,
     );
-    let dyn_database: cdk_common::database::DynMintDatabase = database.clone();
+    activate_setup_with_db_and_faults(
+        database,
+        config_path,
+        now_unix,
+        export_fault,
+        activation_fault,
+    )
+    .await
+}
+
+/// Activate the finished setup over `database`, writing the final config pair.
+#[cfg(feature = "sqlite")]
+#[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+pub(crate) async fn activate_setup_with_db(
+    database: cdk_common::database::DynMintDatabase,
+    config_path: &Path,
+    now_unix: u64,
+) -> Result<FederationSetupActivationResult> {
+    activate_setup_with_db_and_faults(
+        database,
+        config_path,
+        now_unix,
+        FinalConfigExportFault::None,
+        SetupActivationFault::None,
+    )
+    .await
+}
+
+#[cfg(feature = "sqlite")]
+async fn activate_setup_with_db_and_faults(
+    database: cdk_common::database::DynMintDatabase,
+    config_path: &Path,
+    now_unix: u64,
+    export_fault: FinalConfigExportFault,
+    activation_fault: SetupActivationFault,
+) -> Result<FederationSetupActivationResult> {
+    let config = read_local_config(config_path)?;
+    let handoff = load_certified_dkg_handoff_from_state(&config, now_unix)?;
     let records =
-        crate::federation_dkg_status::read_database_records_from_database(&dyn_database).await?;
+        crate::federation_dkg_status::read_database_records_from_database(&database).await?;
     let (_, finalized) =
         records.finalization_progress(&handoff.public_config, &handoff.private_config);
     let mut finalized = finalized.ok_or_else(|| anyhow!(
@@ -1416,7 +1682,7 @@ async fn persist_local_manifest<DB>(
     now_unix: u64,
 ) -> Result<()>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     manifest
         .validate(config.url_policy)
@@ -1511,7 +1777,7 @@ fn setup_network(network: cli::FederationSetupNetworkArg) -> FederationSetupBitc
 }
 
 #[cfg(feature = "sqlite")]
-fn setup_url_policy(allow_insecure_localhost: bool) -> FederationSetupUrlPolicy {
+pub(crate) fn setup_url_policy(allow_insecure_localhost: bool) -> FederationSetupUrlPolicy {
     match allow_insecure_localhost {
         true => FederationSetupUrlPolicy::AllowInsecureLocalhost,
         false => FederationSetupUrlPolicy::RequireSecureTransport,
@@ -1603,6 +1869,7 @@ pub(crate) struct FederationSetupCreateResult {
     pub(crate) config_path: PathBuf,
     pub(crate) setup_id: FederationSetupId,
     pub(crate) invitation_paths: BTreeMap<MemberId, PathBuf>,
+    pub(crate) invitations: BTreeMap<MemberId, FederationSetupInvitation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1630,6 +1897,11 @@ impl FederationSetupLocalConfig {
 
     pub(crate) fn manifest_path(&self) -> &Path {
         &self.manifest_path
+    }
+
+    #[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+    pub(crate) fn local_role(&self) -> FederationSetupLocalRole {
+        self.local_role
     }
 
     #[cfg(feature = "sqlite")]
@@ -1843,7 +2115,7 @@ pub(crate) async fn create_setup<DB>(
     now_unix: u64,
 ) -> Result<FederationSetupCreateResult>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     spec.validate()?;
     std::fs::create_dir_all(state_directory)
@@ -1941,6 +2213,7 @@ where
         config_path: config_path.to_path_buf(),
         setup_id: secrets.setup_id,
         invitation_paths,
+        invitations,
     })
 }
 
@@ -1958,7 +2231,7 @@ pub(crate) async fn join_setup<DB, C>(
     now_unix: u64,
 ) -> Result<FederationSetupEnrollment>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
     C: FederationSetupCoordinator,
 {
     invitation
@@ -2054,7 +2327,7 @@ pub(crate) async fn propose_setup<DB>(
     now_unix: u64,
 ) -> Result<FederationSetupProposal>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     let (config, secrets) = load_local_state(config_path, now_unix)?;
     let draft = config
@@ -2130,7 +2403,7 @@ pub(crate) async fn review_local_proposal<DB>(
     now_unix: u64,
 ) -> Result<FederationSetupProposalReview>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     let (config, secrets) = load_local_state(config_path, now_unix)?;
     validate_proposal_for_local_state(&proposal, &config, &secrets)?;
@@ -2177,7 +2450,7 @@ pub(crate) async fn fetch_and_review_proposal<DB, C>(
     now_unix: u64,
 ) -> Result<FederationSetupProposalReview>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
     C: FederationSetupCoordinator,
 {
     let (_, secrets) = load_local_state(config_path, now_unix)?;
@@ -2200,7 +2473,7 @@ pub(crate) async fn approve_setup<DB, C>(
     now_unix: u64,
 ) -> Result<cdk_common::federation::FederationSetupApproval>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
     C: FederationSetupCoordinator,
 {
     let (config, secrets) = load_local_state(config_path, now_unix)?;
@@ -2280,7 +2553,7 @@ pub(crate) async fn issue_invitation<DB>(
     now_unix: u64,
 ) -> Result<FederationSetupInvitation>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     let (config, secrets) = load_local_state(config_path, now_unix)?;
     let draft = config
@@ -2440,7 +2713,7 @@ async fn persist_creator_state<'a, DB>(
     now_unix: u64,
 ) -> Result<()>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     let existing_session = db
         .get_federation_setup_session(config.setup_id)
@@ -2509,7 +2782,7 @@ async fn persist_pending_join<DB>(
     now_unix: u64,
 ) -> Result<()>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     let session = db
         .get_federation_setup_session(config.setup_id)
@@ -2540,7 +2813,7 @@ async fn mark_local_enrollment_accepted<DB>(
     now_unix: u64,
 ) -> Result<()>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     let session = require_local_session(db, config).await?;
     if session.participant_phase != FederationSetupParticipantPhase::IdentityCreated {
@@ -2565,7 +2838,7 @@ async fn require_local_session<DB>(
     config: &FederationSetupLocalConfig,
 ) -> Result<FederationSetupSession>
 where
-    DB: Database<DatabaseError> + Send + Sync + 'static,
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
 {
     let session = db
         .get_federation_setup_session(config.setup_id)

@@ -93,8 +93,9 @@ fn setup_create_builds_bark_policy_into_the_signed_frost_inputs() {
         allow_insecure_localhost: false,
     };
 
-    let frost = setup_frost_policy(&args, FederationSetupBitcoinNetwork::Signet)
-        .expect("setup FROST policy");
+    let params = FederationSetupCreateParams::from_cli(&args).expect("setup create params");
+    assert_eq!(params.network, FederationSetupBitcoinNetwork::Signet);
+    let frost = setup_frost_policy(&params).expect("setup FROST policy");
     assert_eq!(
         frost.applications.len(),
         usize::from(cfg!(feature = "federation-bdk")) + 2
