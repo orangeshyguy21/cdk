@@ -107,6 +107,24 @@ impl IrohServer {
             }
         }
     }
+
+    /// Stops accepting, drains served connections, and returns the still-open node.
+    ///
+    /// Unlike [`Self::shutdown`], the endpoint stays bound so another server can
+    /// take over the same identity without rebinding it.
+    pub async fn stop_serving(self) -> Result<IrohNode, Error> {
+        self.cancellation.cancel();
+        let mut task = self.task;
+        match tokio::time::timeout(self.node.config().timeouts.shutdown, &mut task).await {
+            Ok(Ok(result)) => result.map(|()| self.node),
+            Ok(Err(_)) => Err(Error::Server),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(Error::ShutdownTimeout)
+            }
+        }
+    }
 }
 
 impl fmt::Debug for IrohServer {
