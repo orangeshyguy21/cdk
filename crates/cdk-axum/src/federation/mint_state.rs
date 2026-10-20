@@ -640,7 +640,6 @@ impl MintState {
             .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn persist_federation_dkg_sequence(
         &self,
         sender: MemberId,

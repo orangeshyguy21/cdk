@@ -2,11 +2,12 @@ use axum::extract::{Json, State};
 use axum::response::{IntoResponse, Response};
 use cdk::federation::{
     redact_federation_operator_message, FederationDkgActivationRequest,
-    FederationDkgCommitmentRequest, FederationDkgReadinessRequest, FederationDkgRevealRequest,
-    FederationDkgSecretShareRequest, FederationDkgSetupResponse,
+    FederationDkgCommitmentRequest, FederationDkgParticipantCommitment,
+    FederationDkgParticipantCommitmentReveal, FederationDkgReadinessRequest,
+    FederationDkgRevealRequest, FederationDkgSecretShareRequest, FederationDkgSetupResponse,
     FederationDkgTranscriptSignatureRequest, FederationFrostDkgConfirmationRequest,
     FederationFrostDkgRound1Request, FederationFrostDkgRound2Record,
-    FederationFrostDkgRound2Request, FederationRestMessageKind, FederationSignedRequest,
+    FederationFrostDkgRound2Request, FederationRestMessageKind, FederationSignedRequest, MemberId,
 };
 use cdk_frost::rand_core::OsRng;
 use serde::Serialize;
@@ -54,13 +55,123 @@ fn active_dkg_config(
         .federation
         .dkg_auto_start_config()
         .cloned()
-        .ok_or_else(|| {
-            (
-                axum::http::StatusCode::CONFLICT,
-                "federation DKG ceremony is not active",
-            )
-                .into_response()
-        })
+        .ok_or_else(dkg_not_active_response)
+}
+
+fn dkg_not_active_response() -> Response {
+    (
+        axum::http::StatusCode::CONFLICT,
+        "federation DKG ceremony is not active",
+    )
+        .into_response()
+}
+
+/// A DKG message that a peer may resend after this member finished its ceremony.
+enum StoredDkgMessage<'a> {
+    Commitment(&'a FederationDkgParticipantCommitment),
+    Reveal(&'a FederationDkgParticipantCommitmentReveal),
+    SecretShare(&'a FederationDkgSecretShareRequest),
+    FrostConfirmation(&'a FederationFrostDkgConfirmationRequest),
+    TranscriptSignature(&'a FederationDkgTranscriptSignatureRequest),
+    Activation(&'a FederationDkgActivationRequest),
+}
+
+impl StoredDkgMessage<'_> {
+    fn kind(&self) -> FederationRestMessageKind {
+        match self {
+            Self::Commitment(_) => FederationRestMessageKind::DkgCommitment,
+            Self::Reveal(_) => FederationRestMessageKind::DkgReveal,
+            Self::SecretShare(_) => FederationRestMessageKind::DkgSecretShare,
+            Self::FrostConfirmation(_) => FederationRestMessageKind::FrostDkgConfirmation,
+            Self::TranscriptSignature(_) => FederationRestMessageKind::DkgTranscriptSignature,
+            Self::Activation(_) => FederationRestMessageKind::DkgActivation,
+        }
+    }
+
+    /// Whether this member already stored exactly this message from `sender`.
+    async fn is_stored(
+        &self,
+        state: &MintState,
+        sender: MemberId,
+        local_member: MemberId,
+    ) -> Result<bool, cdk::Error> {
+        let db = state.mint.localstore();
+        let stored = match self {
+            Self::Commitment(message) => db
+                .get_federation_dkg_commitments()
+                .await?
+                .iter()
+                .any(|stored| stored == *message && stored.member_id == sender),
+            Self::Reveal(message) => db
+                .get_federation_dkg_reveals()
+                .await?
+                .iter()
+                .any(|stored| stored == *message && stored.member_id == sender),
+            Self::SecretShare(message) => db
+                .get_federation_dkg_secret_share_contributions()
+                .await?
+                .iter()
+                .any(|stored| {
+                    stored == *message && stored.sender == sender && stored.receiver == local_member
+                }),
+            Self::FrostConfirmation(message) => db
+                .get_federation_frost_dkg_confirmations()
+                .await?
+                .iter()
+                .any(|stored| stored == *message && stored.member_id == sender),
+            Self::TranscriptSignature(message) => db
+                .get_federation_dkg_transcript_signatures()
+                .await?
+                .iter()
+                .any(|stored| stored == *message && stored.signer == sender),
+            Self::Activation(message) => db
+                .get_federation_dkg_activations()
+                .await?
+                .iter()
+                .any(|stored| stored == *message && stored.signer == sender),
+        };
+        Ok(stored)
+    }
+}
+
+/// Acknowledge a DKG message again after this member's ceremony has ended.
+///
+/// A peer's DKG driver finishes only once every member has acknowledged each of its
+/// messages, and it resends any message whose acknowledgement it never saw. A member
+/// that already finished and activated has no active ceremony, so it acknowledges an
+/// exact copy of a message it stored from the same sender. Anything else is refused
+/// because no ceremony is active.
+async fn acknowledge_stored_dkg_message(
+    state: &MintState,
+    verified: super::VerifiedFederationRequest,
+    message: StoredDkgMessage<'_>,
+) -> Result<Json<FederationDkgSetupResponse>, Response> {
+    let runtime_config = federation_runtime_config(state)?;
+    let local_member = runtime_config.member_id();
+    if !message
+        .is_stored(state, verified.sender, local_member)
+        .await
+        .map_err(dkg_error_response)?
+    {
+        return Err(dkg_not_active_response());
+    }
+    state
+        .persist_federation_dkg_sequence(verified.sender, verified.sequence)
+        .await
+        .map_err(dkg_error_response)?;
+    let kind = message.kind();
+    tracing::debug!(
+        member_id = %verified.sender,
+        request_kind = ?kind,
+        "Acknowledged a stored DKG message after the ceremony ended"
+    );
+
+    Ok(Json(FederationDkgSetupResponse::new(
+        runtime_config.federation_id(),
+        local_member,
+        kind,
+        verified.sender,
+    )))
 }
 
 fn dkg_finalized_config_not_ready_response() -> Response {
@@ -137,7 +248,14 @@ pub(super) async fn post_dkg_commitment(
     let admission =
         admit_dkg_request(&state, &payload, FederationRestMessageKind::DkgCommitment).await?;
     let verified = admission.verified;
-    let dkg_config = active_dkg_config(&state)?;
+    let Some(dkg_config) = state.federation.dkg_auto_start_config().cloned() else {
+        return acknowledge_stored_dkg_message(
+            &state,
+            verified,
+            StoredDkgMessage::Commitment(&payload.payload.commitment),
+        )
+        .await;
+    };
     let runtime_config = federation_runtime_config(&state)?;
     payload
         .payload
@@ -174,7 +292,14 @@ pub(super) async fn post_dkg_reveal(
     let admission =
         admit_dkg_request(&state, &payload, FederationRestMessageKind::DkgReveal).await?;
     let verified = admission.verified;
-    let dkg_config = active_dkg_config(&state)?;
+    let Some(dkg_config) = state.federation.dkg_auto_start_config().cloned() else {
+        return acknowledge_stored_dkg_message(
+            &state,
+            verified,
+            StoredDkgMessage::Reveal(&payload.payload.reveal),
+        )
+        .await;
+    };
     let runtime_config = federation_runtime_config(&state)?;
     payload
         .payload
@@ -208,7 +333,14 @@ pub(super) async fn post_dkg_secret_share(
     let admission =
         admit_dkg_request(&state, &payload, FederationRestMessageKind::DkgSecretShare).await?;
     let verified = admission.verified;
-    let dkg_config = active_dkg_config(&state)?;
+    let Some(dkg_config) = state.federation.dkg_auto_start_config().cloned() else {
+        return acknowledge_stored_dkg_message(
+            &state,
+            verified,
+            StoredDkgMessage::SecretShare(&payload.payload),
+        )
+        .await;
+    };
     let runtime_config = federation_runtime_config(&state)?;
     payload
         .payload
@@ -367,7 +499,14 @@ pub(super) async fn post_frost_dkg_confirmation(
     let kind = FederationRestMessageKind::FrostDkgConfirmation;
     let admission = admit_dkg_request(&state, &payload, kind).await?;
     let verified = admission.verified;
-    let dkg_config = active_dkg_config(&state)?;
+    let Some(dkg_config) = state.federation.dkg_auto_start_config().cloned() else {
+        return acknowledge_stored_dkg_message(
+            &state,
+            verified,
+            StoredDkgMessage::FrostConfirmation(&payload.payload),
+        )
+        .await;
+    };
     let runtime_config = federation_runtime_config(&state)?;
     if payload.payload.context.ceremony_id != dkg_config.ceremony_id
         || payload.payload.context.root_key_epoch != dkg_config.root_key_epoch
@@ -433,7 +572,14 @@ pub(super) async fn post_dkg_transcript_signature(
     )
     .await?;
     let verified = admission.verified;
-    let _dkg_config = active_dkg_config(&state)?;
+    if state.federation.dkg_auto_start_config().is_none() {
+        return acknowledge_stored_dkg_message(
+            &state,
+            verified,
+            StoredDkgMessage::TranscriptSignature(&payload.payload),
+        )
+        .await;
+    }
     let runtime_config = federation_runtime_config(&state)?;
     payload
         .payload
@@ -466,7 +612,14 @@ pub(super) async fn post_dkg_activation(
     let admission =
         admit_dkg_request(&state, &payload, FederationRestMessageKind::DkgActivation).await?;
     let verified = admission.verified;
-    let dkg_config = active_dkg_config(&state)?;
+    let Some(dkg_config) = state.federation.dkg_auto_start_config().cloned() else {
+        return acknowledge_stored_dkg_message(
+            &state,
+            verified,
+            StoredDkgMessage::Activation(&payload.payload),
+        )
+        .await;
+    };
     if payload.payload.ceremony_id != dkg_config.ceremony_id {
         return Err(federation_error_response(
             cdk::federation::FederationError::DkgTranscriptMismatch {

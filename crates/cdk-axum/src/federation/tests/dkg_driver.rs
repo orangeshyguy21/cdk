@@ -207,6 +207,35 @@ impl DkgDriverTestFederation {
         self.members[index].client = client;
     }
 
+    /// Serve a completed member as an activated member: its final config on the
+    /// same database, with no DKG ceremony configured.
+    async fn activate_member(&self, index: usize) -> MintState {
+        let member = &self.members[index];
+        let finalized = member
+            .state
+            .ready_federation_dkg_finalized_member_config()
+            .expect("completed member has a finalized config");
+        let mut state = federation_route_state_for_private_with_db(
+            finalized.public_config.clone(),
+            finalized.private_config.clone(),
+            member.db.clone(),
+            &member.seed,
+        )
+        .await;
+        state.federation.set_dkg_components(None, None);
+        let public_member = self
+            .public_config
+            .member(member.private_config.member_id)
+            .expect("configured activated member");
+        self.transport.insert(
+            public_member.federation_api_url.clone(),
+            Router::new()
+                .nest("/api/federation/v1", create_federation_router())
+                .with_state(state.clone()),
+        );
+        state
+    }
+
     async fn assert_complete_and_consistent(&self) {
         let mut finalized_public_config = None;
         let mut frost_public_package = None;
@@ -871,6 +900,189 @@ async fn frost_confirmation_mismatch_fails_before_sequence_or_record_mutation() 
             .expect("sequences after FROST mismatch"),
         before_sequences
     );
+}
+
+#[tokio::test]
+async fn activated_member_acknowledges_stored_dkg_messages_and_refuses_new_ones() {
+    let federation = DkgDriverTestFederation::new().await;
+    federation.drive_until_complete(12).await;
+    let receiver = &federation.members[0];
+    let sender = &federation.members[1];
+    let receiver_id = receiver.private_config.member_id;
+    let sender_id = sender.private_config.member_id;
+    let activated = federation.activate_member(0).await;
+    let receiver_public = federation
+        .public_config
+        .member(receiver_id)
+        .expect("configured receiver");
+
+    let commitment = receiver
+        .db
+        .get_federation_dkg_commitments()
+        .await
+        .expect("commitments")
+        .into_iter()
+        .find(|commitment| {
+            commitment.ceremony_id == federation.ceremony_id && commitment.member_id == sender_id
+        })
+        .expect("sender commitment");
+    sender
+        .client
+        .submit_dkg_commitment(
+            receiver_public,
+            &FederationDkgCommitmentRequest::new(commitment),
+        )
+        .await
+        .expect("stored commitment is acknowledged");
+    let reveal = receiver
+        .db
+        .get_federation_dkg_reveals()
+        .await
+        .expect("reveals")
+        .into_iter()
+        .find(|reveal| {
+            reveal.ceremony_id == federation.ceremony_id && reveal.member_id == sender_id
+        })
+        .expect("sender reveal");
+    sender
+        .client
+        .submit_dkg_reveal(receiver_public, &FederationDkgRevealRequest::new(reveal))
+        .await
+        .expect("stored reveal is acknowledged");
+    let secret_share = receiver
+        .db
+        .get_federation_dkg_secret_share_contributions()
+        .await
+        .expect("secret shares")
+        .into_iter()
+        .find(|share| share.sender == sender_id && share.receiver == receiver_id)
+        .expect("sender secret share");
+    sender
+        .client
+        .submit_dkg_secret_share(receiver_public, &secret_share)
+        .await
+        .expect("stored secret share is acknowledged");
+    let confirmation = receiver
+        .db
+        .get_federation_frost_dkg_confirmations()
+        .await
+        .expect("FROST confirmations")
+        .into_iter()
+        .find(|confirmation| confirmation.member_id == sender_id)
+        .expect("sender FROST confirmation");
+    sender
+        .client
+        .submit_frost_dkg_confirmation(receiver_public, &confirmation)
+        .await
+        .expect("stored FROST confirmation is acknowledged");
+    let transcript_signature = receiver
+        .db
+        .get_federation_dkg_transcript_signatures()
+        .await
+        .expect("transcript signatures")
+        .into_iter()
+        .find(|signature| signature.signer == sender_id)
+        .expect("sender transcript signature");
+    sender
+        .client
+        .submit_dkg_transcript_signature(receiver_public, &transcript_signature)
+        .await
+        .expect("stored transcript signature is acknowledged");
+    let activation = receiver
+        .db
+        .get_federation_dkg_activations()
+        .await
+        .expect("activations")
+        .into_iter()
+        .find(|activation| activation.signer == sender_id)
+        .expect("sender activation");
+    sender
+        .client
+        .submit_dkg_activation(receiver_public, &activation)
+        .await
+        .expect("stored activation is acknowledged");
+
+    let before_activations = receiver
+        .db
+        .get_federation_dkg_activations()
+        .await
+        .expect("activations before new activation");
+    let before_sequences = receiver
+        .db
+        .get_federation_dkg_member_sequences()
+        .await
+        .expect("sequences before new activation");
+    let mut changed = activation;
+    changed.final_config_digest = cdk::federation::FederationConfigDigest::from_bytes([99; 32]);
+    let sequence = before_sequences
+        .get(&sender_id)
+        .copied()
+        .unwrap_or_default()
+        .saturating_add(1);
+    let request = FederationSignedRequest::new_signed(
+        federation.public_config.federation_id,
+        receiver_id,
+        sequence,
+        FederationRestMessageKind::DkgActivation,
+        changed,
+        &sender.private_config,
+    )
+    .expect("signed new activation");
+    let response = post_dkg_activation(State(activated), Json(request))
+        .await
+        .expect_err("a new activation needs an active ceremony");
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        receiver
+            .db
+            .get_federation_dkg_activations()
+            .await
+            .expect("activations after new activation"),
+        before_activations
+    );
+    assert_eq!(
+        receiver
+            .db
+            .get_federation_dkg_member_sequences()
+            .await
+            .expect("sequences after new activation"),
+        before_sequences
+    );
+}
+
+#[tokio::test]
+async fn dkg_member_completes_after_a_peer_activates() {
+    let federation = DkgDriverTestFederation::new().await;
+    federation.drive_until_complete(12).await;
+    // Member 1 has left setup and serves its final config, while member 2 never saw
+    // the acknowledgements for its own messages and sends them all again.
+    federation.activate_member(0).await;
+
+    let member = &federation.members[1];
+    let mut delivery_tracker = member.delivery_tracker.lock().await;
+    *delivery_tracker = FederationDkgDeliveryTracker::default();
+    let mut completed = false;
+    for _ in 0..3 {
+        let tick = run_federation_dkg_driver_tick(
+            &member.state,
+            &member.client,
+            &member.participant,
+            FederationDkgSecretShareTransportPolicy::RequireSecureTransport,
+            &mut delivery_tracker,
+        )
+        .await
+        .expect("DKG driver tick");
+        assert!(
+            tick.failed_members.is_empty(),
+            "deliveries failed to {:?}",
+            tick.failed_members
+        );
+        if tick.is_complete() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "member 2 completes after member 1 activated");
 }
 
 #[tokio::test]
