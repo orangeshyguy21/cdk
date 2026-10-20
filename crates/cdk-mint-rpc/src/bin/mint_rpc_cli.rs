@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
+use cdk_mint_rpc::federation_setup::federation_setup_service_client::FederationSetupServiceClient;
 use cdk_mint_rpc::info::mint_info_service_client::MintInfoServiceClient;
 use cdk_mint_rpc::keyset::keyset_service_client::KeysetServiceClient;
 use cdk_mint_rpc::mint_rpc_cli::subcommands;
@@ -118,6 +119,9 @@ enum Commands {
     ListWalletTransactions(subcommands::WalletPaginationCommand),
     /// List addresses revealed by the BDK on-chain wallet
     ListWalletAddresses(subcommands::WalletPaginationCommand),
+    /// Set up a federation on a daemon running in federation setup mode
+    #[command(subcommand)]
+    FederationSetup(subcommands::FederationSetupCommand),
 }
 
 #[tokio::main]
@@ -253,6 +257,10 @@ async fn main() -> Result<()> {
         }
         Commands::ListWalletAddresses(args) => {
             subcommands::list_wallet_addresses(&mut wallet_client, &args).await?;
+        }
+        Commands::FederationSetup(command) => {
+            let mut setup_client = FederationSetupServiceClient::new(channel);
+            subcommands::federation_setup(&mut setup_client, &command).await?;
         }
     }
 
