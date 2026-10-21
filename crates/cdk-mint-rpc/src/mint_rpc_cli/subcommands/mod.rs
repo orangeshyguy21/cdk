@@ -1,5 +1,6 @@
 //! Subcommands for the mint RPC CLI
 
+mod federation;
 mod federation_setup;
 mod info;
 mod keyset;
@@ -7,6 +8,10 @@ mod payment_method;
 mod quote;
 mod wallet;
 
+pub use self::federation::{
+    federation, FederationCommand, FederationMembersCommand, FederationOutputCommand,
+    FederationStatusCommand,
+};
 pub use self::federation_setup::{
     federation_setup, ApproveSetupCommand, CreateSetupCommand, FederationSetupCommand,
     JoinSetupCommand, SetupOutputCommand,

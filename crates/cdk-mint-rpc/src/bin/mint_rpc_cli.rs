@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
+use cdk_mint_rpc::federation::federation_service_client::FederationServiceClient;
 use cdk_mint_rpc::federation_setup::federation_setup_service_client::FederationSetupServiceClient;
 use cdk_mint_rpc::info::mint_info_service_client::MintInfoServiceClient;
 use cdk_mint_rpc::keyset::keyset_service_client::KeysetServiceClient;
@@ -122,6 +123,9 @@ enum Commands {
     /// Set up a federation on a daemon running in federation setup mode
     #[command(subcommand)]
     FederationSetup(subcommands::FederationSetupCommand),
+    /// Read the status of a running federation member
+    #[command(subcommand)]
+    Federation(subcommands::FederationCommand),
 }
 
 #[tokio::main]
@@ -261,6 +265,10 @@ async fn main() -> Result<()> {
         Commands::FederationSetup(command) => {
             let mut setup_client = FederationSetupServiceClient::new(channel);
             subcommands::federation_setup(&mut setup_client, &command).await?;
+        }
+        Commands::Federation(command) => {
+            let mut federation_client = FederationServiceClient::new(channel);
+            subcommands::federation(&mut federation_client, &command).await?;
         }
     }
 
