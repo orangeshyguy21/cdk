@@ -113,6 +113,8 @@ mod federation_setup_mode;
 mod federation_smoke;
 #[cfg(feature = "federation")]
 mod federation_status;
+#[cfg(all(feature = "federation", feature = "management-rpc"))]
+mod federation_status_rpc;
 #[cfg(feature = "federation-bdk")]
 mod federation_wallet_operator;
 #[cfg(feature = "iroh")]
@@ -2786,6 +2788,15 @@ impl PreparedMintd {
             },
         )
         .await?;
+        // Only a federation member gets services, and with them the status RPCs
+        #[cfg(all(feature = "federation", feature = "management-rpc"))]
+        if let Some(services) = federation_services.as_ref() {
+            rpc_to_start = rpc_to_start.map(|(mint_rpc, tls_dir)| {
+                let provider =
+                    federation_status_rpc::federation_status_provider(services.status_handle());
+                (mint_rpc.with_federation_status_provider(provider), tls_dir)
+            });
+        }
         #[cfg(not(feature = "federation"))]
         let v1_service = cdk_axum::create_mint_router_with_custom_cache(
             Arc::clone(&mint),
