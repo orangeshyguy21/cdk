@@ -7,7 +7,7 @@
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -28,14 +28,11 @@ use cdk_common::federation::{
 };
 use cdk_mint_rpc::federation as proto;
 use cdk_mint_rpc::{
-    DynFederationStatusProvider, FederationStatusError, FederationStatusErrorKind,
-    FederationStatusProvider,
+    DynFederationStatusProvider, FederationStatusProvider, ProviderError, ProviderErrorKind,
 };
 use tokio::sync::Mutex;
 
-use crate::federation_digest_agreement::{
-    DigestAgreement, DigestAgreementState, DigestConflictKind,
-};
+use crate::federation_digest_agreement::{DigestAgreement, DigestConflictKind};
 use crate::federation_status::encode_commitment;
 
 /// How long one round of member status requests answers repeated calls.
@@ -65,13 +62,13 @@ struct CachedMemberStatuses {
 }
 
 impl FederationStatusRpcProvider {
-    fn runtime_config(&self) -> Result<&FederationRuntimeConfig, FederationStatusError> {
+    fn runtime_config(&self) -> Result<&FederationRuntimeConfig, ProviderError> {
         self.handle.runtime_config().ok_or_else(not_a_member)
     }
 
     async fn member_statuses(
         &self,
-    ) -> Result<(u64, Arc<Vec<FederationMemberLocalStatus>>), FederationStatusError> {
+    ) -> Result<(u64, Arc<Vec<FederationMemberLocalStatus>>), ProviderError> {
         let mut cache = self.member_statuses.lock().await;
         if let Some(cached) = cache.as_ref() {
             if cached.fetched_at.elapsed() < MEMBER_STATUS_CACHE_TTL {
@@ -79,10 +76,10 @@ impl FederationStatusRpcProvider {
             }
         }
 
-        let queried_at_unix = unix_now();
+        let queried_at_unix = cdk::util::unix_time();
         let statuses = Arc::new(
             self.handle
-                .member_local_statuses(&[])
+                .member_local_statuses()
                 .await
                 .map_err(status_error)?,
         );
@@ -100,7 +97,7 @@ impl FederationStatusProvider for FederationStatusRpcProvider {
     async fn get_federation_info(
         &self,
         _request: proto::GetFederationInfoRequest,
-    ) -> Result<proto::GetFederationInfoResponse, FederationStatusError> {
+    ) -> Result<proto::GetFederationInfoResponse, ProviderError> {
         let runtime = self
             .handle
             .effective_config()
@@ -113,7 +110,7 @@ impl FederationStatusProvider for FederationStatusRpcProvider {
     async fn get_local_status(
         &self,
         request: proto::GetLocalStatusRequest,
-    ) -> Result<proto::GetLocalStatusResponse, FederationStatusError> {
+    ) -> Result<proto::GetLocalStatusResponse, ProviderError> {
         let status = self.handle.local_status().await.map_err(status_error)?;
         Ok(proto::GetLocalStatusResponse {
             status: Some(member_status(
@@ -126,7 +123,7 @@ impl FederationStatusProvider for FederationStatusRpcProvider {
     async fn get_member_statuses(
         &self,
         request: proto::GetMemberStatusesRequest,
-    ) -> Result<proto::GetMemberStatusesResponse, FederationStatusError> {
+    ) -> Result<proto::GetMemberStatusesResponse, ProviderError> {
         let roster = &self.runtime_config()?.public_config().members;
         let selected = request
             .member_ids
@@ -137,7 +134,7 @@ impl FederationStatusProvider for FederationStatusRpcProvider {
                     .and_then(|member_id| MemberId::new(member_id).ok())
                     .filter(|member_id| roster.contains_key(member_id))
                     .ok_or_else(|| {
-                        FederationStatusError::invalid_argument(format!(
+                        ProviderError::invalid_argument(format!(
                             "The federation has no member {member_id}"
                         ))
                     })
@@ -159,45 +156,38 @@ impl FederationStatusProvider for FederationStatusRpcProvider {
     async fn get_custody_status(
         &self,
         _request: proto::GetCustodyStatusRequest,
-    ) -> Result<proto::GetCustodyStatusResponse, FederationStatusError> {
+    ) -> Result<proto::GetCustodyStatusResponse, ProviderError> {
         let custody = self.handle.custody_status().await.map_err(status_error)?;
         custody_status(&custody)
     }
 }
 
-fn not_a_member() -> FederationStatusError {
-    FederationStatusError::failed_precondition("This daemon is not running as a federation member")
+fn not_a_member() -> ProviderError {
+    ProviderError::failed_precondition("This daemon is not running as a federation member")
 }
 
 /// Maps a status failure onto the gRPC category matching its REST status.
-fn status_error(error: FederationLocalStatusError) -> FederationStatusError {
+fn status_error(error: FederationLocalStatusError) -> ProviderError {
     let kind = match error.http_status() {
-        StatusCode::BAD_REQUEST => FederationStatusErrorKind::InvalidArgument,
+        StatusCode::BAD_REQUEST => ProviderErrorKind::InvalidArgument,
         StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::CONFLICT => {
-            FederationStatusErrorKind::FailedPrecondition
+            ProviderErrorKind::FailedPrecondition
         }
-        StatusCode::TOO_MANY_REQUESTS => FederationStatusErrorKind::ResourceExhausted,
-        StatusCode::SERVICE_UNAVAILABLE => FederationStatusErrorKind::Unavailable,
-        _ => FederationStatusErrorKind::Internal,
+        StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::ResourceExhausted,
+        StatusCode::SERVICE_UNAVAILABLE => ProviderErrorKind::Unavailable,
+        _ => ProviderErrorKind::Internal,
     };
-    if kind == FederationStatusErrorKind::Internal {
+    if kind == ProviderErrorKind::Internal {
         tracing::error!(
             "Federation status failed: {}",
             redact_federation_operator_message(&error.to_string())
         );
     }
-    FederationStatusError::new(kind, error.public_message())
+    ProviderError::new(kind, error.public_message())
 }
 
 fn report_limit(limit: u32) -> usize {
     usize::try_from(limit).unwrap_or(usize::MAX)
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
 }
 
 fn member_ids<'a, I>(members: I) -> Vec<u32>
@@ -547,11 +537,18 @@ pub(crate) fn member_statuses_response(
 }
 
 pub(crate) fn digest_agreement(agreement: &DigestAgreement) -> proto::DigestAgreement {
-    let state = match agreement.state() {
-        DigestAgreementState::Unknown => proto::DigestAgreementState::Unknown,
-        DigestAgreementState::Converged => proto::DigestAgreementState::Converged,
-        DigestAgreementState::Converging => proto::DigestAgreementState::Converging,
-        DigestAgreementState::Diverged => proto::DigestAgreementState::Diverged,
+    // Unknown: nothing compared. Diverged: a digest alert or a contradiction.
+    // Converging: members differ in height, session, or a missing digest.
+    let state = if agreement.compared_members.is_empty() {
+        proto::DigestAgreementState::Unknown
+    } else if !agreement.digest_alert_members.is_empty() || !agreement.conflicts.is_empty() {
+        proto::DigestAgreementState::Diverged
+    } else if !agreement.missing_application_digest_members.is_empty()
+        || !agreement.differing_members.is_empty()
+    {
+        proto::DigestAgreementState::Converging
+    } else {
+        proto::DigestAgreementState::Converged
     };
     let sorted = |members: &[MemberId]| {
         let mut members = member_ids(members);
@@ -604,7 +601,7 @@ pub(crate) fn digest_agreement(agreement: &DigestAgreement) -> proto::DigestAgre
 
 pub(crate) fn custody_status(
     custody: &FederationCustodyStatus,
-) -> Result<proto::GetCustodyStatusResponse, FederationStatusError> {
+) -> Result<proto::GetCustodyStatusResponse, ProviderError> {
     Ok(proto::GetCustodyStatusResponse {
         onchain_wallets: custody
             .onchain_wallets
@@ -797,18 +794,17 @@ fn wallet_liveness(liveness: &FederationWalletLivenessStatus) -> proto::WalletLi
 #[cfg(feature = "federation-bark")]
 fn bark_operator(
     custody: &FederationCustodyStatus,
-) -> Result<Option<proto::BarkOperatorStatus>, FederationStatusError> {
+) -> Result<Option<proto::BarkOperatorStatus>, ProviderError> {
     let Some(value) = custody.application_operators.get("bark") else {
         return Ok(None);
     };
     let bark =
-        serde_json::from_value::<cdk_federation_bark::FederationBarkOperatorStatus>(value.clone())
-            .map_err(|error| {
-                FederationStatusError::internal(format!("invalid Bark status: {error}"))
-            })?;
-    let details_json = serde_json::to_string(value).map_err(|error| {
-        FederationStatusError::internal(format!("invalid Bark status: {error}"))
-    })?;
+        <cdk_federation_bark::FederationBarkOperatorStatus as serde::Deserialize>::deserialize(
+            value,
+        )
+        .map_err(|error| ProviderError::internal(format!("invalid Bark status: {error}")))?;
+    let details_json = serde_json::to_string(value)
+        .map_err(|error| ProviderError::internal(format!("invalid Bark status: {error}")))?;
     Ok(Some(proto::BarkOperatorStatus {
         readiness: bark.readiness,
         degraded_reason: bark.degraded_reason,
@@ -842,7 +838,7 @@ fn bark_operator(
 #[cfg(not(feature = "federation-bark"))]
 fn bark_operator(
     _custody: &FederationCustodyStatus,
-) -> Result<Option<proto::BarkOperatorStatus>, FederationStatusError> {
+) -> Result<Option<proto::BarkOperatorStatus>, ProviderError> {
     Ok(None)
 }
 

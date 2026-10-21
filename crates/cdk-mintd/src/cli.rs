@@ -504,13 +504,20 @@ pub struct FederationSetupCreateArgs {
     )]
     pub checkpoint_interval_canonical_bytes: u64,
     /// Invitation validity in seconds.
-    #[arg(long, default_value_t = 86_400)]
+    #[arg(
+        long,
+        default_value_t = crate::federation_setup_command::DEFAULT_SETUP_INVITATION_LIFETIME_SECS
+    )]
     pub invitation_lifetime_seconds: u64,
     /// Currency unit for the first BLS keyset.
     #[arg(long, default_value = "sat")]
     pub unit: String,
     /// Comma-separated denominations for the first BLS keyset.
-    #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16,32,64,128")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = crate::federation_setup_command::DEFAULT_SETUP_AMOUNTS
+    )]
     pub amounts: Vec<u64>,
     /// Input fee in parts per thousand for the first BLS keyset.
     #[arg(long, default_value_t = 0)]

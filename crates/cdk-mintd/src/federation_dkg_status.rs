@@ -749,20 +749,6 @@ impl DkgCompletionRecords {
         Ok(&self.frost_roots)
     }
 
-    /// Whether the one current ceremony is durably complete.
-    #[cfg(feature = "sqlite")]
-    fn current_ceremony_complete(&self) -> bool {
-        let mut current = self
-            .ceremonies
-            .iter()
-            .filter(|record| record.replacement_ceremony_id.is_none())
-            .filter(|record| record.state != FederationDkgCeremonyState::Aborted);
-        match (current.next(), current.next()) {
-            (Some(record), None) => record.state == FederationDkgCeremonyState::Complete,
-            _ => false,
-        }
-    }
-
     #[cfg(feature = "sqlite")]
     pub(crate) fn finalization_progress(
         &self,
@@ -837,7 +823,8 @@ impl DkgCompletionRecords {
         // Holding every confirmation is not enough to leave setup: peers only
         // get this member's confirmation from its own driver, which marks the
         // ceremony complete once every member has acknowledged it.
-        let finalized_ready = finalized.is_some() && self.current_ceremony_complete();
+        let finalized_ready = finalized.is_some()
+            && FederationDkgCeremonyRecord::current_is_complete(&self.ceremonies);
         let progress = FederationSetupDkgProgress {
             phase: phase.to_string(),
             participant_states: summary.participant_states,

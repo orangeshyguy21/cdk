@@ -3018,6 +3018,32 @@ impl FederationLocalStatusResponse {
     pub const fn has_digest_alert(&self) -> bool {
         self.checkpoint.frontier.materialized_state_audit_mismatch
     }
+
+    /// Check that this status came from `member_id` of `federation_id` at the
+    /// supported REST version.
+    pub fn validate_source(&self, federation_id: FederationId, member_id: MemberId) -> Result<()> {
+        for version in [self.version, self.peer_status.version] {
+            if version != FEDERATION_REST_API_VERSION {
+                return Err(FederationError::RestVersionMismatch {
+                    expected: FEDERATION_REST_API_VERSION,
+                    found: version,
+                });
+            }
+        }
+        if self.peer_status.federation_id != federation_id {
+            return Err(FederationError::RestFederationMismatch {
+                expected: federation_id,
+                found: self.peer_status.federation_id,
+            });
+        }
+        if self.peer_status.member_id != member_id {
+            return Err(FederationError::MemberIdMismatch {
+                expected: member_id,
+                found: self.peer_status.member_id,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Scalar metadata for one stored, previously verified checkpoint quorum.

@@ -1,12 +1,11 @@
 //! Read-only member status for management interfaces.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cdk::federation::{
-    redact_federation_operator_message, FederationConfig, FederationError,
-    FederationLocalStatusResponse, FederationRestMessageKind, MemberConfigPublic, MemberId,
+    redact_federation_operator_message, FederationLocalStatusResponse, FederationRestMessageKind,
+    MemberId,
 };
 use cdk::mint::FederationRuntimeConfig;
 use cdk_http_client::Transport;
@@ -109,19 +108,18 @@ impl FederationStatusHandle {
         build_custody_status(&self.state, member_id).await
     }
 
-    /// Asks members for their local status, one at a time, in member order.
+    /// Asks every member for its local status, one at a time, in member order.
     ///
-    /// An empty `members` asks every member. The local member is read in
-    /// process; the others are asked over the federation transport with this
-    /// member's identity key. A member that cannot be reached or answers with
-    /// an invalid status gets an error entry instead of failing the call.
+    /// The local member is read in process; the others are asked over the
+    /// federation transport with this member's identity key. A member that
+    /// cannot be reached or answers with an invalid status gets an error entry
+    /// instead of failing the call.
     #[instrument(skip_all)]
     pub async fn member_local_statuses(
         &self,
-        members: &[MemberId],
     ) -> Result<Vec<FederationMemberLocalStatus>, FederationLocalStatusError> {
         let client = self.peer_client().await?;
-        member_local_statuses_with_client(self, client, members).await
+        member_local_statuses_with_client(self, client).await
     }
 
     async fn peer_client(
@@ -148,7 +146,6 @@ impl FederationStatusHandle {
 pub(crate) async fn member_local_statuses_with_client<T>(
     handle: &FederationStatusHandle,
     client: &FederationRestPeerClient<T>,
-    members: &[MemberId],
 ) -> Result<Vec<FederationMemberLocalStatus>, FederationLocalStatusError>
 where
     T: Transport,
@@ -157,10 +154,10 @@ where
         .runtime_config()
         .ok_or(FederationLocalStatusError::NotConfigured)?;
     let local_member = runtime.member_id();
-    let targets = status_targets(runtime.public_config(), members)?;
-    let mut statuses = Vec::with_capacity(targets.len());
+    let members = runtime.public_config().members.values();
+    let mut statuses = Vec::with_capacity(members.len());
     // One member at a time keeps a status request from adding load in bursts
-    for member in targets {
+    for member in members {
         let started = Instant::now();
         let local = member.member_id == local_member;
         let status = match local {
@@ -169,7 +166,7 @@ where
                 .await
                 .map_err(|error| error.public_message()),
             false => client
-                .local_status(&member)
+                .local_status(member)
                 .await
                 .map_err(|error| redact_federation_operator_message(&error.to_string())),
         };
@@ -182,28 +179,4 @@ where
     }
 
     Ok(statuses)
-}
-
-/// Resolves requested member IDs against the roster, in member order.
-fn status_targets(
-    public_config: &FederationConfig,
-    members: &[MemberId],
-) -> Result<Vec<MemberConfigPublic>, FederationLocalStatusError> {
-    if members.is_empty() {
-        return Ok(public_config.members.values().cloned().collect());
-    }
-
-    members
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|member_id| {
-            public_config.member(member_id).cloned().ok_or_else(|| {
-                FederationLocalStatusError::Mint(cdk::Error::Federation(
-                    FederationError::UnknownMember { member_id },
-                ))
-            })
-        })
-        .collect()
 }

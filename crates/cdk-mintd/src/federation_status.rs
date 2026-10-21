@@ -4,11 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 pub(crate) use cdk_common::federation::FederationLocalStatusResponse;
 use cdk_common::federation::{
-    redact_federation_operator_message, FederationConfig, FederationId,
-    FederationPaymentObservationReportAction, FederationPaymentObservationReportStatus,
-    FederationPaymentObservationReportSummary, FederationPeerStatusRequest,
-    FederationRestMessageKind, FederationSignedRequest, MemberConfigPrivate, MemberConfigPublic,
-    MemberId, FEDERATION_REST_API_VERSION,
+    redact_federation_operator_message, FederationConfig, FederationPaymentObservationReportAction,
+    FederationPaymentObservationReportStatus, FederationPaymentObservationReportSummary,
+    FederationPeerStatusRequest, FederationRestMessageKind, FederationSignedRequest,
+    MemberConfigPrivate, MemberConfigPublic, MemberId,
 };
 use cdk_http_client::Transport;
 
@@ -164,11 +163,18 @@ where
     let url = member
         .federation_api_url
         .join_paths(&["federation", "v1", "local-status"])?;
-    let response = transport
+    let response: FederationLocalStatusResponse = transport
         .http_post(url, None, &request)
         .await?
         .json_or_status_error()?;
-    validate_local_status(public_config.federation_id, member, &response)?;
+    response
+        .validate_source(public_config.federation_id, member.member_id)
+        .with_context(|| {
+            format!(
+                "federation member {} returned an invalid local status",
+                member.member_id
+            )
+        })?;
     Ok(response)
 }
 
@@ -189,44 +195,6 @@ pub(crate) fn status_targets(
             })
         })
         .collect()
-}
-
-fn validate_local_status(
-    expected_federation_id: FederationId,
-    member: &MemberConfigPublic,
-    response: &FederationLocalStatusResponse,
-) -> Result<()> {
-    if response.version != FEDERATION_REST_API_VERSION {
-        bail!(
-            "federation member {} returned unsupported local status version {}",
-            member.member_id,
-            response.version
-        );
-    }
-    if response.peer_status.version != FEDERATION_REST_API_VERSION {
-        bail!(
-            "federation member {} returned unsupported peer status version {}",
-            member.member_id,
-            response.peer_status.version
-        );
-    }
-    if response.peer_status.federation_id != expected_federation_id {
-        bail!(
-            "federation member {} returned status for federation {}, expected {}",
-            member.member_id,
-            response.peer_status.federation_id,
-            expected_federation_id
-        );
-    }
-    if response.peer_status.member_id != member.member_id {
-        bail!(
-            "federation member status mismatch: expected {}, found {}",
-            member.member_id,
-            response.peer_status.member_id
-        );
-    }
-
-    Ok(())
 }
 
 fn print_statuses(
@@ -767,11 +735,7 @@ fn ensure_statuses_operation_lag(
 fn ensure_statuses_no_digest_alerts(statuses: &[FederationLocalStatusResponse]) -> Result<()> {
     let agreement = DigestAgreement::from_statuses(statuses);
     ensure_statuses_have_application_digest(&agreement)?;
-    if let Some(status) = agreement.digest_alert_members.first().and_then(|member| {
-        statuses
-            .iter()
-            .find(|status| status.peer_status.member_id == *member)
-    }) {
+    if let Some(status) = statuses.iter().find(|status| status.has_digest_alert()) {
         bail!(
             "federation member {} reports digest alert: sync={} message={}",
             status.peer_status.member_id,

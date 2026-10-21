@@ -15,6 +15,7 @@ use cdk_common::federation::{
     FederationWalletBroadcastHealth, FederationWalletOperationPhase,
     FederationWalletOperationPhaseCount, FederationWalletOperatorStatus, FederationWalletUtxoState,
     FederationWalletUtxoStatusCount, ThresholdParams, TrustedDealerKeysetSpec, TrustedDealerMember,
+    FEDERATION_REST_API_VERSION,
 };
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::nut22::AuthToken;
@@ -364,9 +365,15 @@ async fn status_query_rejects_mismatched_member_response() {
         .await
         .expect_err("mismatched status member should fail");
 
-    assert!(err
-        .to_string()
-        .contains("federation member status mismatch"));
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("federation member 1 returned an invalid local status"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Federation member id mismatch: expected=1, found=2"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

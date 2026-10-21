@@ -264,7 +264,7 @@ where
             FederationRestMessageKind::Status,
             FederationPeerStatusRequest::default(),
         )?;
-        let status = self
+        let status: FederationLocalStatusResponse = self
             .http_post_with_timeout(
                 member,
                 "local-status",
@@ -273,7 +273,7 @@ where
                 self.sync_config.peer_request_timeout,
             )
             .await?;
-        validate_local_status(&self.public_config, member, &status)?;
+        status.validate_source(self.public_config.federation_id, member.member_id)?;
         Ok(status)
     }
 
@@ -1353,38 +1353,6 @@ fn federation_endpoint(member: &MemberConfigPublic, endpoint: &str) -> anyhow::R
     Ok(member
         .federation_api_url
         .join_paths(&["federation", "v1", endpoint])?)
-}
-
-fn validate_local_status(
-    public_config: &FederationConfig,
-    member: &MemberConfigPublic,
-    status: &FederationLocalStatusResponse,
-) -> anyhow::Result<()> {
-    for version in [status.version, status.peer_status.version] {
-        if version != FEDERATION_REST_API_VERSION {
-            return Err(FederationError::RestVersionMismatch {
-                expected: FEDERATION_REST_API_VERSION,
-                found: version,
-            }
-            .into());
-        }
-    }
-    if status.peer_status.federation_id != public_config.federation_id {
-        return Err(FederationError::RestFederationMismatch {
-            expected: public_config.federation_id,
-            found: status.peer_status.federation_id,
-        }
-        .into());
-    }
-    if status.peer_status.member_id != member.member_id {
-        return Err(FederationError::MemberIdMismatch {
-            expected: member.member_id,
-            found: status.peer_status.member_id,
-        }
-        .into());
-    }
-
-    Ok(())
 }
 
 fn validate_peer_status(

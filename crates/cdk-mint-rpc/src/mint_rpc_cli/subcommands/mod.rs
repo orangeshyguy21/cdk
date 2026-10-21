@@ -4,17 +4,17 @@ mod federation;
 mod federation_setup;
 mod info;
 mod keyset;
+mod output;
 mod payment_method;
 mod quote;
 mod wallet;
 
 pub use self::federation::{
-    federation, FederationCommand, FederationMembersCommand, FederationOutputCommand,
-    FederationStatusCommand,
+    federation, FederationCommand, FederationMembersCommand, FederationStatusCommand,
 };
 pub use self::federation_setup::{
     federation_setup, ApproveSetupCommand, CreateSetupCommand, FederationSetupCommand,
-    JoinSetupCommand, SetupOutputCommand,
+    JoinSetupCommand,
 };
 pub use self::info::{
     add_contact, add_url, get_info, remove_contact, remove_url, update_icon_url,
@@ -24,6 +24,7 @@ pub use self::info::{
     UpdateShortDescriptionCommand, UpdateTosUrlCommand,
 };
 pub use self::keyset::{rotate_next_keyset, RotateNextKeysetCommand};
+pub use self::output::OutputCommand;
 pub use self::payment_method::{
     update_disabled, update_melt_method, update_mint_method, UpdateDisabledCommand,
     UpdateMeltMethodCommand, UpdateMintMethodCommand,

@@ -96,16 +96,7 @@ impl IrohServer {
     pub async fn shutdown(self) -> Result<(), Error> {
         self.cancellation.cancel();
         self.node.close().await;
-        let mut task = self.task;
-        match tokio::time::timeout(self.node.config().timeouts.shutdown, &mut task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(Error::Server),
-            Err(_) => {
-                task.abort();
-                let _ = task.await;
-                Err(Error::ShutdownTimeout)
-            }
-        }
+        join_accept_loop(self.task, self.node.config().timeouts.shutdown).await
     }
 
     /// Stops accepting, drains served connections, and returns the still-open node.
@@ -114,15 +105,23 @@ impl IrohServer {
     /// take over the same identity without rebinding it.
     pub async fn stop_serving(self) -> Result<IrohNode, Error> {
         self.cancellation.cancel();
-        let mut task = self.task;
-        match tokio::time::timeout(self.node.config().timeouts.shutdown, &mut task).await {
-            Ok(Ok(result)) => result.map(|()| self.node),
-            Ok(Err(_)) => Err(Error::Server),
-            Err(_) => {
-                task.abort();
-                let _ = task.await;
-                Err(Error::ShutdownTimeout)
-            }
+        join_accept_loop(self.task, self.node.config().timeouts.shutdown).await?;
+        Ok(self.node)
+    }
+}
+
+/// Waits for the accept loop to drain, aborting it after `timeout`.
+async fn join_accept_loop(
+    mut task: JoinHandle<Result<(), Error>>,
+    timeout: std::time::Duration,
+) -> Result<(), Error> {
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(Error::Server),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(Error::ShutdownTimeout)
         }
     }
 }

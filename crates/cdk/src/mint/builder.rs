@@ -88,9 +88,6 @@ pub struct MintBuilder {
     max_batch_size: Option<u64>,
     #[cfg(feature = "federation")]
     federation_config: Option<FederationRuntimeConfig>,
-    /// Whether building switches to a finalized config found in durable DKG records.
-    #[cfg(feature = "federation")]
-    activate_federation_dkg_records: bool,
     /// Interval at which the built signatory reloads keysets from the shared
     /// database. `None` (the default) disables the reload for a single-instance
     /// deployment that owns its database; set an interval only to run several
@@ -142,8 +139,6 @@ impl MintBuilder {
             keyset_refresh_interval: None,
             #[cfg(feature = "federation")]
             federation_config: None,
-            #[cfg(feature = "federation")]
-            activate_federation_dkg_records: true,
         }
     }
 
@@ -162,18 +157,6 @@ impl MintBuilder {
     #[cfg(feature = "federation")]
     pub fn with_federation_config(mut self, federation_config: FederationRuntimeConfig) -> Self {
         self.federation_config = Some(federation_config);
-        self
-    }
-
-    /// Keep the attached setup config even when durable DKG records already hold
-    /// a complete finalized config.
-    ///
-    /// A setup-only DKG member uses this so that, after a restart, its DKG driver
-    /// resumes and completes the ceremony instead of being skipped because the
-    /// finalized key material looks active.
-    #[cfg(feature = "federation")]
-    pub fn without_federation_dkg_record_activation(mut self) -> Self {
-        self.activate_federation_dkg_records = false;
         self
     }
 
@@ -238,6 +221,18 @@ impl MintBuilder {
                     .to_string(),
             }
             .into());
+        }
+        // The driver marks a ceremony complete only after every member has
+        // acknowledged this member's confirmation. Until then keep the setup
+        // config, so a restarted member resumes its driver instead of skipping it.
+        if current_ceremonies
+            .first()
+            .is_some_and(|record| record.state != FederationDkgCeremonyState::Complete)
+        {
+            tracing::info!(
+                "Federation DKG startup activation waiting for the ceremony to complete"
+            );
+            return Ok(());
         }
         let current_ceremony_id = current_ceremonies.first().map(|record| record.ceremony_id);
 
@@ -822,9 +817,7 @@ impl MintBuilder {
         signatory: Arc<dyn Signatory + Send + Sync>,
     ) -> Result<Mint, Error> {
         #[cfg(feature = "federation")]
-        if self.activate_federation_dkg_records {
-            self.activate_federation_dkg_records_if_complete().await?;
-        }
+        self.activate_federation_dkg_records_if_complete().await?;
 
         #[cfg(feature = "federation")]
         let federation_has_active_keyset = self

@@ -11,20 +11,6 @@ use cdk_common::federation::{FederationApplicationDigest, FederationJournalDiges
 
 use crate::federation_status::FederationLocalStatusResponse;
 
-/// Overall result of comparing member statuses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DigestAgreementState {
-    /// No statuses were compared.
-    Unknown,
-    /// Every member is at the same point with the same digests.
-    Converged,
-    /// Members differ in height, session, or a missing digest, but nothing
-    /// contradicts.
-    Converging,
-    /// A member reports a digest alert or two members contradict each other.
-    Diverged,
-}
-
 /// What two members disagree on at the same operation count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DigestConflictKind {
@@ -161,20 +147,6 @@ impl DigestAgreement {
             differing_members,
             conflicts,
         }
-    }
-
-    pub(crate) fn state(&self) -> DigestAgreementState {
-        if self.compared_members.is_empty() {
-            return DigestAgreementState::Unknown;
-        }
-        if !self.digest_alert_members.is_empty() || !self.conflicts.is_empty() {
-            return DigestAgreementState::Diverged;
-        }
-        if !self.missing_application_digest_members.is_empty() || !self.differing_members.is_empty()
-        {
-            return DigestAgreementState::Converging;
-        }
-        DigestAgreementState::Converged
     }
 }
 

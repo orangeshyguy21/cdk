@@ -333,15 +333,15 @@ fn status_errors_map_to_grpc_categories() {
     let cases = [
         (
             FederationLocalStatusError::NotConfigured,
-            FederationStatusErrorKind::FailedPrecondition,
+            ProviderErrorKind::FailedPrecondition,
         ),
         (
             FederationLocalStatusError::AdmissionFull,
-            FederationStatusErrorKind::ResourceExhausted,
+            ProviderErrorKind::ResourceExhausted,
         ),
         (
             FederationLocalStatusError::AdmissionClosed,
-            FederationStatusErrorKind::Unavailable,
+            ProviderErrorKind::Unavailable,
         ),
         (
             FederationLocalStatusError::Mint(cdk::Error::Federation(
@@ -349,7 +349,7 @@ fn status_errors_map_to_grpc_categories() {
                     member_id: member(9),
                 },
             )),
-            FederationStatusErrorKind::InvalidArgument,
+            ProviderErrorKind::InvalidArgument,
         ),
         (
             FederationLocalStatusError::Mint(cdk::Error::Federation(
@@ -359,7 +359,7 @@ fn status_errors_map_to_grpc_categories() {
                     attempted_operation_id: "attempted".to_string(),
                 },
             )),
-            FederationStatusErrorKind::FailedPrecondition,
+            ProviderErrorKind::FailedPrecondition,
         ),
         (
             FederationLocalStatusError::Mint(cdk::Error::Federation(
@@ -367,11 +367,11 @@ fn status_errors_map_to_grpc_categories() {
                     component: "consensus",
                 },
             )),
-            FederationStatusErrorKind::Unavailable,
+            ProviderErrorKind::Unavailable,
         ),
         (
             FederationLocalStatusError::Internal(anyhow::anyhow!("secret=hidden")),
-            FederationStatusErrorKind::Internal,
+            ProviderErrorKind::Internal,
         ),
     ];
 
@@ -436,8 +436,8 @@ fn member_statuses_report_unreachable_members_and_compare_the_rest() {
 fn digest_agreement_separates_lag_from_conflicts() {
     let (config, _) = federation_fixture();
 
-    let nobody = DigestAgreement::from_statuses(&[]);
-    assert_eq!(nobody.state(), DigestAgreementState::Unknown);
+    let nobody = digest_agreement(&DigestAgreement::from_statuses(&[]));
+    assert_eq!(nobody.state(), proto::DigestAgreementState::Unknown);
 
     let behind = [local_status(&config, 1, 5), local_status(&config, 2, 4)];
     let behind = digest_agreement(&DigestAgreement::from_statuses(&behind));

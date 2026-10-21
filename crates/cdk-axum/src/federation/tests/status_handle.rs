@@ -263,7 +263,7 @@ async fn member_local_statuses_report_an_unreachable_member_without_failing() {
     let client = FederationRestPeerClient::new(transport.clone(), &public_config, first_private)
         .expect("peer client");
 
-    let statuses = member_local_statuses_with_client(&handle, &client, &[])
+    let statuses = member_local_statuses_with_client(&handle, &client)
         .await
         .expect("member statuses");
 
@@ -307,17 +307,6 @@ async fn member_local_statuses_report_an_unreachable_member_without_failing() {
             .verify(&public_config, receiver)
             .expect("signed status request");
     }
-
-    let selected = member_local_statuses_with_client(&handle, &client, &[member_id(2)])
-        .await
-        .expect("selected member status");
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].member_id, member_id(2));
-
-    let unknown = member_local_statuses_with_client(&handle, &client, &[member_id(9)])
-        .await
-        .expect_err("unknown member is rejected");
-    assert_eq!(unknown.http_status(), axum::http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -331,11 +320,14 @@ async fn member_local_statuses_reject_a_status_for_another_member() {
     let client = FederationRestPeerClient::new(transport, &public_config, first_private)
         .expect("peer client");
 
-    let statuses = member_local_statuses_with_client(&handle, &client, &[member_id(3)])
+    let statuses = member_local_statuses_with_client(&handle, &client)
         .await
         .expect("member statuses");
 
-    let error = statuses[0]
+    let error = statuses
+        .iter()
+        .find(|status| status.member_id == member_id(3))
+        .expect("member three entry")
         .status
         .as_ref()
         .expect_err("status for another member is rejected");

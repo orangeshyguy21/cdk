@@ -926,6 +926,17 @@ impl FederationSetupBitcoinNetwork {
         }
     }
 
+    /// Lowercase network name, matching the serialized form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bitcoin => "bitcoin",
+            Self::Testnet => "testnet",
+            Self::Signet => "signet",
+            Self::Regtest => "regtest",
+        }
+    }
+
     /// Convert to the corresponding Bitcoin network.
     #[must_use]
     pub const fn bitcoin_network(self) -> bitcoin::Network {
@@ -934,6 +945,28 @@ impl FederationSetupBitcoinNetwork {
             Self::Testnet => bitcoin::Network::Testnet,
             Self::Signet => bitcoin::Network::Signet,
             Self::Regtest => bitcoin::Network::Regtest,
+        }
+    }
+}
+
+impl fmt::Display for FederationSetupBitcoinNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for FederationSetupBitcoinNetwork {
+    type Err = FederationError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "bitcoin" => Ok(Self::Bitcoin),
+            "testnet" => Ok(Self::Testnet),
+            "signet" => Ok(Self::Signet),
+            "regtest" => Ok(Self::Regtest),
+            _ => Err(invalid(
+                "unknown setup network; expected bitcoin, testnet, signet, or regtest",
+            )),
         }
     }
 }
@@ -1854,7 +1887,8 @@ fn validate_setup_url(
     }
 }
 
-fn is_iroh_setup_url(value: &MintUrl) -> bool {
+/// Whether a setup URL names an Iroh endpoint.
+pub fn is_iroh_setup_url(value: &MintUrl) -> bool {
     Url::parse(&value.to_string())
         .ok()
         .is_some_and(|url| url.scheme() == "iroh")

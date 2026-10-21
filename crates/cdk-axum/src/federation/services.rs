@@ -188,6 +188,11 @@ impl RunningFederationServices {
         self.tasks.stop.clone().cancelled_owned()
     }
 
+    /// Whether a worker failure or a shutdown request has stopped the services.
+    pub fn is_stopped(&self) -> bool {
+        self.tasks.stop.is_cancelled()
+    }
+
     /// Stop scheduling, finish in-flight work, then join every owned task.
     pub async fn shutdown(self) -> Result<(), cdk::Error> {
         let outcome = self.tasks.shutdown().await;

@@ -362,6 +362,31 @@ pub struct FederationDkgCeremonyRecord {
 }
 
 impl FederationDkgCeremonyRecord {
+    /// The one current ceremony: neither replaced nor aborted.
+    ///
+    /// Returns `None` when there is no current ceremony or more than one.
+    #[must_use]
+    pub fn current(records: &[Self]) -> Option<&Self> {
+        let mut current = records
+            .iter()
+            .filter(|record| record.replacement_ceremony_id.is_none())
+            .filter(|record| record.state != FederationDkgCeremonyState::Aborted);
+        match (current.next(), current.next()) {
+            (Some(record), None) => Some(record),
+            _ => None,
+        }
+    }
+
+    /// Whether the one current ceremony is durably complete.
+    ///
+    /// The DKG driver marks a ceremony complete only after every member has
+    /// acknowledged this member's final-config confirmation.
+    #[must_use]
+    pub fn current_is_complete(records: &[Self]) -> bool {
+        Self::current(records)
+            .is_some_and(|record| record.state == FederationDkgCeremonyState::Complete)
+    }
+
     /// Create a new active ceremony record.
     #[must_use]
     pub fn active(

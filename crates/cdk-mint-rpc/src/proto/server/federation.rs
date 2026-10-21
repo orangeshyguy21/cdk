@@ -9,7 +9,7 @@ use crate::federation::{
     GetFederationInfoResponse, GetLocalStatusRequest, GetLocalStatusResponse,
     GetMemberStatusesRequest, GetMemberStatusesResponse,
 };
-use crate::{DynFederationStatusProvider, FederationStatusError, FederationStatusErrorKind};
+use crate::DynFederationStatusProvider;
 
 const DEFAULT_PAYMENT_REPORT_LIMIT: u32 = 50;
 const MAX_PAYMENT_REPORT_LIMIT: u32 = 500;
@@ -32,21 +32,6 @@ fn payment_report_limit(requested: u32) -> Result<u32, Status> {
     }
 }
 
-fn into_status(error: FederationStatusError) -> Status {
-    match error.kind() {
-        FederationStatusErrorKind::InvalidArgument => Status::invalid_argument(error.message()),
-        FederationStatusErrorKind::FailedPrecondition => {
-            Status::failed_precondition(error.message())
-        }
-        FederationStatusErrorKind::ResourceExhausted => Status::resource_exhausted(error.message()),
-        FederationStatusErrorKind::Unavailable => Status::unavailable(error.message()),
-        FederationStatusErrorKind::Internal => {
-            tracing::error!("Federation status request failed: {}", error);
-            Status::internal(error.message())
-        }
-    }
-}
-
 #[tonic::async_trait]
 impl FederationService for MintRPCServer {
     /// Returns the federation config this member runs.
@@ -58,7 +43,7 @@ impl FederationService for MintRPCServer {
             .get_federation_info(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Returns this member's own status.
@@ -73,7 +58,7 @@ impl FederationService for MintRPCServer {
             .get_local_status(request)
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Asks members for their status and compares their digests.
@@ -88,7 +73,7 @@ impl FederationService for MintRPCServer {
             .get_member_statuses(request)
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Returns this member's custody status.
@@ -100,7 +85,7 @@ impl FederationService for MintRPCServer {
             .get_custody_status(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 }
 
@@ -114,7 +99,7 @@ mod tests {
     use super::super::test_utils::create_test_rpc_server;
     use super::*;
     use crate::federation::{MemberStatus, MemberStatusResult};
-    use crate::FederationStatusProvider;
+    use crate::{FederationStatusProvider, ProviderError, ProviderErrorKind};
 
     /// Echoes the payment report limit it receives and fails custody.
     struct StubProvider;
@@ -124,7 +109,7 @@ mod tests {
         async fn get_federation_info(
             &self,
             _request: GetFederationInfoRequest,
-        ) -> Result<GetFederationInfoResponse, FederationStatusError> {
+        ) -> Result<GetFederationInfoResponse, ProviderError> {
             Ok(GetFederationInfoResponse {
                 federation_id: "federation".to_string(),
                 local_member_id: 2,
@@ -135,7 +120,7 @@ mod tests {
         async fn get_local_status(
             &self,
             request: GetLocalStatusRequest,
-        ) -> Result<GetLocalStatusResponse, FederationStatusError> {
+        ) -> Result<GetLocalStatusResponse, ProviderError> {
             Ok(GetLocalStatusResponse {
                 status: Some(MemberStatus {
                     member_id: request.payment_report_limit,
@@ -147,7 +132,7 @@ mod tests {
         async fn get_member_statuses(
             &self,
             request: GetMemberStatusesRequest,
-        ) -> Result<GetMemberStatusesResponse, FederationStatusError> {
+        ) -> Result<GetMemberStatusesResponse, ProviderError> {
             Ok(GetMemberStatusesResponse {
                 members: request
                     .member_ids
@@ -165,9 +150,9 @@ mod tests {
         async fn get_custody_status(
             &self,
             _request: GetCustodyStatusRequest,
-        ) -> Result<GetCustodyStatusResponse, FederationStatusError> {
-            Err(FederationStatusError::new(
-                FederationStatusErrorKind::ResourceExhausted,
+        ) -> Result<GetCustodyStatusResponse, ProviderError> {
+            Err(ProviderError::new(
+                ProviderErrorKind::ResourceExhausted,
                 "too many status requests",
             ))
         }

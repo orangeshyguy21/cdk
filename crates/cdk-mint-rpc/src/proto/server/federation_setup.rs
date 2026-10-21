@@ -21,7 +21,7 @@ use crate::federation_setup::{
     JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest, ProposeSetupResponse,
     ReviewProposalRequest, ReviewProposalResponse,
 };
-use crate::{DynFederationSetupProvider, FederationSetupError, FederationSetupErrorKind};
+use crate::DynFederationSetupProvider;
 
 /// RPC server that serves only `FederationSetupService`.
 ///
@@ -152,19 +152,6 @@ struct SetupServiceHandler {
     provider: DynFederationSetupProvider,
 }
 
-fn into_status(error: FederationSetupError) -> Status {
-    match error.kind() {
-        FederationSetupErrorKind::InvalidArgument => Status::invalid_argument(error.message()),
-        FederationSetupErrorKind::FailedPrecondition => {
-            Status::failed_precondition(error.message())
-        }
-        FederationSetupErrorKind::Internal => {
-            tracing::error!("Federation setup request failed: {}", error);
-            Status::internal(error.message())
-        }
-    }
-}
-
 #[tonic::async_trait]
 impl FederationSetupService for SetupServiceHandler {
     /// Starts a new setup with this daemon as the coordinator.
@@ -176,7 +163,7 @@ impl FederationSetupService for SetupServiceHandler {
             .create_setup(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Joins a setup using an invitation from the coordinator.
@@ -188,7 +175,7 @@ impl FederationSetupService for SetupServiceHandler {
             .join_setup(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Builds the setup proposal once every member has enrolled.
@@ -200,7 +187,7 @@ impl FederationSetupService for SetupServiceHandler {
             .propose_setup(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Returns the current proposal for review.
@@ -212,7 +199,7 @@ impl FederationSetupService for SetupServiceHandler {
             .review_proposal(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Approves the proposal with the requested hash.
@@ -224,7 +211,7 @@ impl FederationSetupService for SetupServiceHandler {
             .approve_proposal(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Returns the local setup state.
@@ -236,7 +223,7 @@ impl FederationSetupService for SetupServiceHandler {
             .get_setup_status(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 
     /// Activates the finished federation config.
@@ -248,7 +235,7 @@ impl FederationSetupService for SetupServiceHandler {
             .activate_setup(request.into_inner())
             .await
             .map(Response::new)
-            .map_err(into_status)
+            .map_err(Status::from)
     }
 }
 
@@ -270,7 +257,7 @@ mod tests {
         GetSetupStatusResponse, JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest,
         ProposeSetupResponse, ReviewProposalRequest, ReviewProposalResponse,
     };
-    use crate::{FederationSetupError, FederationSetupProvider};
+    use crate::{FederationSetupProvider, ProviderError};
 
     /// Answers status as uninitialized and fails the other calls with one
     /// error kind each.
@@ -281,42 +268,42 @@ mod tests {
         async fn create_setup(
             &self,
             _request: CreateSetupRequest,
-        ) -> Result<CreateSetupResponse, FederationSetupError> {
-            Err(FederationSetupError::invalid_argument("threshold too high"))
+        ) -> Result<CreateSetupResponse, ProviderError> {
+            Err(ProviderError::invalid_argument("threshold too high"))
         }
 
         async fn join_setup(
             &self,
             _request: JoinSetupRequest,
-        ) -> Result<JoinSetupResponse, FederationSetupError> {
-            Err(FederationSetupError::failed_precondition("already joined"))
+        ) -> Result<JoinSetupResponse, ProviderError> {
+            Err(ProviderError::failed_precondition("already joined"))
         }
 
         async fn propose_setup(
             &self,
             _request: ProposeSetupRequest,
-        ) -> Result<ProposeSetupResponse, FederationSetupError> {
-            Err(FederationSetupError::internal("database unavailable"))
+        ) -> Result<ProposeSetupResponse, ProviderError> {
+            Err(ProviderError::internal("database unavailable"))
         }
 
         async fn review_proposal(
             &self,
             _request: ReviewProposalRequest,
-        ) -> Result<ReviewProposalResponse, FederationSetupError> {
-            Err(FederationSetupError::failed_precondition("no proposal"))
+        ) -> Result<ReviewProposalResponse, ProviderError> {
+            Err(ProviderError::failed_precondition("no proposal"))
         }
 
         async fn approve_proposal(
             &self,
             _request: ApproveProposalRequest,
-        ) -> Result<ApproveProposalResponse, FederationSetupError> {
-            Err(FederationSetupError::failed_precondition("no proposal"))
+        ) -> Result<ApproveProposalResponse, ProviderError> {
+            Err(ProviderError::failed_precondition("no proposal"))
         }
 
         async fn get_setup_status(
             &self,
             _request: GetSetupStatusRequest,
-        ) -> Result<GetSetupStatusResponse, FederationSetupError> {
+        ) -> Result<GetSetupStatusResponse, ProviderError> {
             Ok(GetSetupStatusResponse {
                 initialized: false,
                 ..Default::default()
@@ -326,8 +313,8 @@ mod tests {
         async fn activate_setup(
             &self,
             _request: ActivateSetupRequest,
-        ) -> Result<ActivateSetupResponse, FederationSetupError> {
-            Err(FederationSetupError::failed_precondition("not finalized"))
+        ) -> Result<ActivateSetupResponse, ProviderError> {
+            Err(ProviderError::failed_precondition("not finalized"))
         }
     }
 

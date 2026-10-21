@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use tonic::transport::Channel;
 use tonic::Request;
 
+use super::output::{list, number, text, OutputCommand};
 use crate::federation::federation_service_client::FederationServiceClient;
 use crate::federation::{
     BarkOperatorStatus, CheckpointStatus, DigestAgreement, GetCustodyStatusRequest,
@@ -18,21 +19,13 @@ use crate::federation::{
 #[derive(Debug, Subcommand)]
 pub enum FederationCommand {
     /// Show the federation config this member runs
-    Info(FederationOutputCommand),
+    Info(OutputCommand),
     /// Show this member's own status
     Status(FederationStatusCommand),
     /// Ask members for their status and compare their digests
     Members(FederationMembersCommand),
     /// Show on-chain wallet and Bark custody status
-    Custody(FederationOutputCommand),
-}
-
-/// Output options for federation read commands.
-#[derive(Debug, Args)]
-pub struct FederationOutputCommand {
-    /// Print JSON instead of text
-    #[arg(long, default_value_t = false)]
-    json: bool,
+    Custody(OutputCommand),
 }
 
 /// Arguments for the local status command.
@@ -73,10 +66,7 @@ pub async fn federation(
     }
 }
 
-async fn info(
-    client: &mut FederationServiceClient<Channel>,
-    args: &FederationOutputCommand,
-) -> Result<()> {
+async fn info(client: &mut FederationServiceClient<Channel>, args: &OutputCommand) -> Result<()> {
     let info = client
         .get_federation_info(Request::new(GetFederationInfoRequest {}))
         .await?
@@ -138,7 +128,7 @@ async fn members(
 
 async fn custody(
     client: &mut FederationServiceClient<Channel>,
-    args: &FederationOutputCommand,
+    args: &OutputCommand,
 ) -> Result<()> {
     let response = client
         .get_custody_status(Request::new(GetCustodyStatusRequest {}))
@@ -161,35 +151,6 @@ fn short_name(name: &str, prefix: &str) -> String {
     name.strip_prefix(prefix)
         .unwrap_or(name)
         .to_ascii_lowercase()
-}
-
-fn text(value: Option<&str>) -> String {
-    value
-        .map(escape_control)
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn number<T>(value: Option<T>) -> String
-where
-    T: ToString,
-{
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn list<T>(values: &[T]) -> String
-where
-    T: ToString,
-{
-    match values {
-        [] => "none".to_string(),
-        values => values
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-    }
 }
 
 fn policy_text(policy: Option<&PaymentVerificationPolicy>) -> String {

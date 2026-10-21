@@ -234,13 +234,9 @@ pub(crate) async fn run_setup_command(
 }
 
 /// Default BLS keyset denominations for a new federation setup.
-#[cfg(feature = "sqlite")]
-#[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
 pub(crate) const DEFAULT_SETUP_AMOUNTS: [u64; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 /// Default invitation lifetime for a new federation setup.
-#[cfg(feature = "sqlite")]
-#[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
 pub(crate) const DEFAULT_SETUP_INVITATION_LIFETIME_SECS: u64 = 86_400;
 
 /// Plain inputs for creating a federation setup, shared by the CLI and the setup RPC.
@@ -284,7 +280,7 @@ pub(crate) struct FederationSetupBarkParams {
 #[cfg(feature = "sqlite")]
 impl FederationSetupCreateParams {
     /// Inputs with the same defaults as `cdk-mintd federation setup create`.
-    #[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+    #[cfg(feature = "management-rpc")]
     pub(crate) fn with_defaults(
         members: u16,
         threshold: u16,
@@ -561,17 +557,18 @@ fn build_setup_coordinator_service(
     Ok(Arc::new(service))
 }
 
-/// Setup-only DKG routes plus their not-yet-started background services.
+/// Setup-only DKG routes plus their running background services.
 #[cfg(feature = "sqlite")]
 pub(crate) struct SetupDkgRouter {
     pub(crate) router: axum::Router,
-    pub(crate) services: Option<cdk_axum::FederationServices>,
+    pub(crate) services: Option<cdk_axum::RunningFederationServices>,
     pub(crate) setup_id: FederationSetupId,
     pub(crate) member_id: MemberId,
     pub(crate) ceremony_id: String,
 }
 
-/// Build the certified member's setup-only DKG routes over `database`.
+/// Build the certified member's setup-only DKG routes over `database` and start
+/// their services.
 ///
 /// Registers the manifest ceremony, which moves the local setup into `dkg_running`.
 #[cfg(feature = "sqlite")]
@@ -600,6 +597,15 @@ pub(crate) async fn build_certified_dkg_router(
     )
     .await
     .context("failed to create setup-only DKG router")?;
+    let services = match services {
+        Some(services) => Some(
+            services
+                .start()
+                .await
+                .context("failed to start setup-only DKG services")?,
+        ),
+        None => None,
+    };
     Ok(SetupDkgRouter {
         router,
         services,
@@ -609,11 +615,23 @@ pub(crate) async fn build_certified_dkg_router(
     })
 }
 
+/// How setup listeners end once their shutdown future resolves.
 #[cfg(feature = "sqlite")]
-async fn ctrl_c_shutdown() -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupServeEnd {
+    /// Close the Iroh endpoint along with the listeners.
+    Close,
+    /// Keep the Iroh endpoint bound and return it for reuse.
+    #[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+    KeepIrohEndpoint,
+}
+
+#[cfg(feature = "sqlite")]
+async fn ctrl_c_shutdown() -> Result<SetupServeEnd> {
     tokio::signal::ctrl_c()
         .await
-        .context("setup listener shutdown signal failed")
+        .context("setup listener shutdown signal failed")?;
+    Ok(SetupServeEnd::Close)
 }
 
 #[cfg(feature = "sqlite")]
@@ -659,7 +677,7 @@ async fn serve_setup_coordinator(
     )
     .await;
     service.shutdown().await;
-    result
+    result.map(drop)
 }
 
 #[cfg(feature = "sqlite")]
@@ -677,20 +695,11 @@ async fn serve_certified_dkg(
     );
     let SetupDkgRouter {
         router,
-        services,
+        services: running,
         setup_id,
         member_id,
         ceremony_id,
     } = build_certified_dkg_router(database, config_path, driver, transport.clone()).await?;
-    let running = match services {
-        Some(services) => Some(
-            services
-                .start()
-                .await
-                .context("failed to start setup-only DKG services")?,
-        ),
-        None => None,
-    };
     let listener = if http_enabled {
         Some(
             tokio::net::TcpListener::bind(listen)
@@ -714,7 +723,8 @@ async fn serve_certified_dkg(
         "setup-only DKG server",
         ctrl_c_shutdown(),
     )
-    .await;
+    .await
+    .map(drop);
     if let Some(running) = running {
         if let Err(error) = running.shutdown().await {
             tracing::warn!(%error, "Setup-only DKG services did not shut down cleanly");
@@ -724,6 +734,9 @@ async fn serve_certified_dkg(
 }
 
 /// Serve setup routes over HTTP and/or Iroh until `shutdown` resolves or a listener fails.
+///
+/// Returns how `shutdown` asked to end, plus the still-bound Iroh endpoint when it
+/// asked to keep it.
 #[cfg(feature = "sqlite")]
 pub(crate) async fn serve_setup_router<S>(
     listener: Option<tokio::net::TcpListener>,
@@ -731,9 +744,9 @@ pub(crate) async fn serve_setup_router<S>(
     transport: cdk_axum::FederationTransport,
     context: &'static str,
     shutdown: S,
-) -> Result<()>
+) -> Result<(SetupServeEnd, crate::IrohHandover)>
 where
-    S: std::future::Future<Output = Result<()>> + Send,
+    S: std::future::Future<Output = Result<SetupServeEnd>> + Send,
 {
     tokio::pin!(shutdown);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -755,51 +768,41 @@ where
     let iroh_server = transport
         .runtime_node()
         .map(|node| cdk_iroh::IrohServer::start(node, router));
-    #[cfg(not(feature = "iroh"))]
-    let _ = (transport, router);
-
     #[cfg(feature = "iroh")]
-    let early_exit = match (http_task.as_mut(), iroh_server.as_ref()) {
-        (Some(http_task), Some(server)) => {
-            tokio::select! {
-                signal = &mut shutdown => {
-                    signal?;
-                    None
-                }
-                result = http_task => Some(result.context("setup HTTP listener task failed")?.context(context)),
-                () = server.finished() => Some(Err(anyhow!("{context} Iroh listener exited unexpectedly"))),
-            }
-        }
-        (Some(http_task), None) => {
-            tokio::select! {
-                signal = &mut shutdown => {
-                    signal?;
-                    None
-                }
-                result = http_task => Some(result.context("setup HTTP listener task failed")?.context(context)),
-            }
-        }
-        (None, Some(server)) => {
-            tokio::select! {
-                signal = &mut shutdown => {
-                    signal?;
-                    None
-                }
-                () = server.finished() => Some(Err(anyhow!("{context} Iroh listener exited unexpectedly"))),
-            }
-        }
-        (None, None) => Some(Err(anyhow!("{context} has no enabled listener"))),
-    };
+    let iroh_enabled = iroh_server.is_some();
     #[cfg(not(feature = "iroh"))]
-    let early_exit = match http_task.as_mut() {
-        Some(http_task) => tokio::select! {
-            signal = &mut shutdown => {
-                signal?;
-                None
+    let iroh_enabled = {
+        let _ = (transport, router);
+        false
+    };
+    if http_task.is_none() && !iroh_enabled {
+        bail!("{context} has no enabled listener");
+    }
+
+    let outcome = {
+        let http_exit = async {
+            match http_task.as_mut() {
+                Some(task) => task.await,
+                None => std::future::pending().await,
             }
-            result = http_task => Some(result.context("setup HTTP listener task failed")?.context(context)),
-        },
-        None => Some(Err(anyhow!("{context} has no enabled listener"))),
+        };
+        #[cfg(feature = "iroh")]
+        let iroh_exit = async {
+            match iroh_server.as_ref() {
+                Some(server) => server.finished().await,
+                None => std::future::pending().await,
+            }
+        };
+        #[cfg(not(feature = "iroh"))]
+        let iroh_exit = std::future::pending::<()>();
+        tokio::select! {
+            end = &mut shutdown => end,
+            result = http_exit => result
+                .context("setup HTTP listener task failed")?
+                .context(context)
+                .map(|()| SetupServeEnd::Close),
+            () = iroh_exit => Err(anyhow!("{context} Iroh listener exited unexpectedly")),
+        }
     };
 
     let _ = shutdown_tx.send(());
@@ -812,16 +815,26 @@ where
         }
     }
     #[cfg(feature = "iroh")]
-    if let Some(server) = iroh_server {
-        server
-            .shutdown()
-            .await
-            .context("setup Iroh shutdown failed")?;
-    }
-    match early_exit {
-        Some(result) => result,
-        None => Ok(()),
-    }
+    let iroh = match (iroh_server, outcome.as_ref()) {
+        (Some(server), Ok(SetupServeEnd::KeepIrohEndpoint)) => {
+            let node = server
+                .stop_serving()
+                .await
+                .context("setup Iroh listener did not stop")?;
+            Some(crate::iroh_runtime::MintdIrohRuntime { node })
+        }
+        (Some(server), _) => {
+            server
+                .shutdown()
+                .await
+                .context("setup Iroh shutdown failed")?;
+            None
+        }
+        (None, _) => None,
+    };
+    #[cfg(not(feature = "iroh"))]
+    let iroh = crate::IrohHandover::default();
+    Ok((outcome?, iroh))
 }
 
 #[cfg(feature = "sqlite")]
@@ -837,11 +850,7 @@ async fn build_certified_dkg_mint(
     let [keyset_spec] = handoff.manifest.keyset_specs() else {
         bail!("setup-only DKG requires exactly one manifest keyset policy");
     };
-    // Stay on the setup config even if every activation is already stored, so a
-    // restarted member resumes its DKG driver and completes the ceremony.
-    let mut builder = cdk::mint::MintBuilder::new(database)
-        .with_federation_config(runtime_config)
-        .without_federation_dkg_record_activation();
+    let mut builder = cdk::mint::MintBuilder::new(database).with_federation_config(runtime_config);
     builder
         .configure_unit(
             keyset_spec.unit.clone(),
@@ -1005,69 +1014,92 @@ pub(crate) async fn setup_status_with_db(
 ) -> Result<FederationSetupCommandStatus> {
     let now_unix = current_unix_time()?;
     let (config, secrets) = load_local_state(config_path, now_unix)?;
-    let manifest = database
+    let bootstrap_status = persist_certified_manifest(
+        &database,
+        config_path,
+        &config,
+        &secrets,
+        client,
+        now_unix,
+        true,
+    )
+    .await?;
+    build_setup_command_status(database, &config, bootstrap_status, now_unix).await
+}
+
+/// Fetch and persist the certified manifest once it exists, without building a status.
+#[cfg(all(feature = "sqlite", feature = "management-rpc"))]
+pub(crate) async fn refresh_certified_manifest(
+    database: &cdk_common::database::DynMintDatabase,
+    config_path: &Path,
+    client: &cdk_axum::FederationSetupHttpClient,
+) -> Result<()> {
+    let now_unix = current_unix_time()?;
+    let (config, secrets) = load_local_state(config_path, now_unix)?;
+    persist_certified_manifest(
+        database,
+        config_path,
+        &config,
+        &secrets,
+        client,
+        now_unix,
+        false,
+    )
+    .await
+    .map(drop)
+}
+
+/// Persist the certified manifest if the database or coordinator has it.
+///
+/// Before certification this returns the coordinator's setup status: a member
+/// always fetches it to learn whether a manifest exists, and the creator reads
+/// it locally only when `want_status` is set.
+#[cfg(feature = "sqlite")]
+async fn persist_certified_manifest(
+    database: &cdk_common::database::DynMintDatabase,
+    config_path: &Path,
+    config: &FederationSetupLocalConfig,
+    secrets: &FederationSetupLocalSecrets,
+    client: &cdk_axum::FederationSetupHttpClient,
+    now_unix: u64,
+    want_status: bool,
+) -> Result<Option<cdk_common::federation::FederationSetupStatus>> {
+    if let Some(manifest) = database
         .get_federation_setup_manifest(config.setup_id)
         .await
-        .context("failed to load the local certified setup manifest")?;
-    let bootstrap_status = if let Some(manifest) = manifest.as_ref() {
-        persist_local_manifest(database.as_ref(), &config, &secrets, manifest, now_unix).await?;
-        None
-    } else {
-        match config.local_role {
-            FederationSetupLocalRole::Coordinator { .. } => {
-                let draft = config
-                    .coordinator
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("local coordinator policy is missing"))?;
-                let coordinator_secret_key = secrets
-                    .coordinator_secret_key
-                    .clone()
-                    .ok_or_else(|| anyhow!("protected setup coordinator identity is missing"))?;
-                let dyn_database: cdk_common::database::DynMintDatabase = database.clone();
-                let service = cdk_axum::FederationSetupCoordinatorService::new(
-                    dyn_database,
-                    config.setup_id,
-                    draft.threshold_params.member_count,
-                    coordinator_secret_key,
-                    config.url_policy,
-                    cdk_axum::FederationSetupCoordinatorServiceConfig::default(),
-                )
-                .context("failed to initialize local setup status reader")?;
-                Some(
-                    service
-                        .local_status()
-                        .await
-                        .context("failed to read local setup status")?,
-                )
-            }
-            FederationSetupLocalRole::Member { .. } => {
-                let invitation = secrets
-                    .invitation
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("protected joining invitation is missing"))?;
-                let status = client
-                    .status(invitation)
+        .context("failed to load the local certified setup manifest")?
+    {
+        persist_local_manifest(database.as_ref(), config, secrets, &manifest, now_unix).await?;
+        return Ok(None);
+    }
+    match config.local_role {
+        FederationSetupLocalRole::Coordinator { .. } if want_status => Ok(Some(
+            build_setup_coordinator_service(database.clone(), config_path)?
+                .local_status()
+                .await
+                .context("failed to read local setup status")?,
+        )),
+        FederationSetupLocalRole::Coordinator { .. } => Ok(None),
+        FederationSetupLocalRole::Member { .. } => {
+            let invitation = secrets
+                .invitation
+                .as_ref()
+                .ok_or_else(|| anyhow!("protected joining invitation is missing"))?;
+            let status = client
+                .status(invitation)
+                .await
+                .context("failed to fetch authenticated setup status")?;
+            if status.manifest_hash.is_some() {
+                let manifest = client
+                    .manifest(invitation)
                     .await
-                    .context("failed to fetch authenticated setup status")?;
-                if status.manifest_hash.is_some() {
-                    let manifest = client
-                        .manifest(invitation)
-                        .await
-                        .context("failed to fetch authenticated certified manifest")?;
-                    persist_local_manifest(
-                        database.as_ref(),
-                        &config,
-                        &secrets,
-                        &manifest,
-                        now_unix,
-                    )
+                    .context("failed to fetch authenticated certified manifest")?;
+                persist_local_manifest(database.as_ref(), config, secrets, &manifest, now_unix)
                     .await?;
-                }
-                Some(status)
             }
+            Ok(Some(status))
         }
-    };
-    build_setup_command_status(database, &config, bootstrap_status, now_unix).await
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -1121,9 +1153,8 @@ async fn build_setup_command_status(
     let dkg = match manifest.as_ref() {
         Some(_) => {
             let handoff = load_certified_dkg_handoff_from_state(config, current_unix_time()?)?;
-            let dyn_database: cdk_common::database::DynMintDatabase = database.clone();
             let records =
-                crate::federation_dkg_status::read_database_records_from_database(&dyn_database)
+                crate::federation_dkg_status::read_database_records_from_database(&database)
                     .await?;
             let (mut progress, finalized) =
                 records.finalization_progress(&handoff.public_config, &handoff.private_config);
@@ -1291,16 +1322,16 @@ async fn activate_setup(
     config_path: &Path,
     now_unix: u64,
 ) -> Result<FederationSetupActivationResult> {
-    activate_setup_with_faults(
-        config_path,
-        now_unix,
-        FinalConfigExportFault::None,
-        SetupActivationFault::None,
-    )
-    .await
+    let config = read_local_config(config_path)?;
+    let database: cdk_common::database::DynMintDatabase = Arc::new(
+        cdk_sqlite::MintSqliteDatabase::new(config.database_path().to_path_buf())
+            .await
+            .context("failed to open setup database for activation")?,
+    );
+    activate_setup_with_db(database, config_path, now_unix).await
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", test))]
 async fn activate_setup_with_faults(
     config_path: &Path,
     now_unix: u64,
@@ -1325,7 +1356,6 @@ async fn activate_setup_with_faults(
 
 /// Activate the finished setup over `database`, writing the final config pair.
 #[cfg(feature = "sqlite")]
-#[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
 pub(crate) async fn activate_setup_with_db(
     database: cdk_common::database::DynMintDatabase,
     config_path: &Path,
@@ -1849,7 +1879,7 @@ const fn participant_phase_label(phase: FederationSetupParticipantPhase) -> &'st
 }
 
 #[cfg(feature = "sqlite")]
-fn parse_mint_url(value: &str, label: &str) -> Result<MintUrl> {
+pub(crate) fn parse_mint_url(value: &str, label: &str) -> Result<MintUrl> {
     MintUrl::from_str(value).with_context(|| format!("invalid {label}"))
 }
 
@@ -1933,7 +1963,7 @@ impl FederationSetupLocalConfig {
         &self.manifest_path
     }
 
-    #[cfg_attr(not(feature = "management-rpc"), allow(dead_code))]
+    #[cfg(feature = "management-rpc")]
     pub(crate) fn local_role(&self) -> FederationSetupLocalRole {
         self.local_role
     }

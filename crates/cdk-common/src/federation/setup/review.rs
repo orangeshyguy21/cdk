@@ -136,7 +136,7 @@ impl fmt::Display for FederationSetupProposalReview {
             self.proposed_federation_id
         )?;
         writeln!(formatter, "proposal_hash: {}", self.proposal_hash)?;
-        writeln!(formatter, "network: {}", network_label(self.network))?;
+        writeln!(formatter, "network: {}", self.network.as_str())?;
         writeln!(
             formatter,
             "protocols: setup={} bls_dkg={} federation_rest={} wallet={} bls_keyset={} frost_dkg={} frost_ciphersuite={}",
@@ -249,15 +249,6 @@ fn application_configuration_fingerprint(configuration: &serde_json::Value) -> S
     let bytes = serde_json::to_vec(&configuration).unwrap_or_default();
     let hash = sha256::Hash::hash(&bytes).to_string();
     hash[..16].to_string()
-}
-
-const fn network_label(network: FederationSetupBitcoinNetwork) -> &'static str {
-    match network {
-        FederationSetupBitcoinNetwork::Bitcoin => "bitcoin",
-        FederationSetupBitcoinNetwork::Testnet => "testnet",
-        FederationSetupBitcoinNetwork::Signet => "signet",
-        FederationSetupBitcoinNetwork::Regtest => "regtest",
-    }
 }
 
 fn payment_policy_label(policy: FederationPaymentVerificationPolicy) -> String {

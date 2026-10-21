@@ -7,6 +7,7 @@ use clap::{Args, Subcommand};
 use tonic::transport::Channel;
 use tonic::Request;
 
+use super::output::{list, number, text, OutputCommand};
 use crate::federation_setup::federation_setup_service_client::FederationSetupServiceClient;
 use crate::federation_setup::{
     ActivateSetupRequest, ApproveProposalRequest, CreateSetupRequest, GetSetupStatusRequest,
@@ -27,11 +28,11 @@ pub enum FederationSetupCommand {
     /// Freeze every enrollment into one proposal (coordinator only)
     Propose,
     /// Show the proposal this member is about to approve
-    Review(SetupOutputCommand),
+    Review(OutputCommand),
     /// Approve the proposal with exactly this hash
     Approve(ApproveSetupCommand),
     /// Show setup and key generation progress
-    Status(SetupOutputCommand),
+    Status(OutputCommand),
     /// Activate the finished federation and restart as a federation member
     Activate,
 }
@@ -108,14 +109,6 @@ pub struct ApproveSetupCommand {
     proposal_hash: String,
 }
 
-/// Output options for read commands.
-#[derive(Debug, Args)]
-pub struct SetupOutputCommand {
-    /// Print JSON instead of text
-    #[arg(long, default_value_t = false)]
-    json: bool,
-}
-
 /// Runs one federation setup command.
 pub async fn federation_setup(
     client: &mut FederationSetupServiceClient<Channel>,
@@ -136,15 +129,13 @@ async fn create(
     client: &mut FederationSetupServiceClient<Channel>,
     args: &CreateSetupCommand,
 ) -> Result<()> {
-    let keyset = match (args.unit.as_ref(), args.amounts.is_empty()) {
-        (None, true) if args.input_fee_ppk == 0 && args.final_expiry.is_none() => None,
-        _ => Some(SetupKeyset {
-            unit: args.unit.clone().unwrap_or_default(),
-            amounts: args.amounts.clone(),
-            input_fee_ppk: args.input_fee_ppk,
-            final_expiry: args.final_expiry,
-        }),
-    };
+    // The server keeps its defaults for an empty unit or amount list
+    let keyset = Some(SetupKeyset {
+        unit: args.unit.clone().unwrap_or_default(),
+        amounts: args.amounts.clone(),
+        input_fee_ppk: args.input_fee_ppk,
+        final_expiry: args.final_expiry,
+    });
     let response = client
         .create_setup(Request::new(CreateSetupRequest {
             members: args.members,
@@ -214,7 +205,7 @@ async fn propose(client: &mut FederationSetupServiceClient<Channel>) -> Result<(
 
 async fn review(
     client: &mut FederationSetupServiceClient<Channel>,
-    args: &SetupOutputCommand,
+    args: &OutputCommand,
 ) -> Result<()> {
     let review = client
         .review_proposal(Request::new(ReviewProposalRequest {}))
@@ -288,7 +279,7 @@ async fn approve(
 
 async fn status(
     client: &mut FederationSetupServiceClient<Channel>,
-    args: &SetupOutputCommand,
+    args: &OutputCommand,
 ) -> Result<()> {
     let status = client
         .get_setup_status(Request::new(GetSetupStatusRequest {}))
@@ -328,42 +319,33 @@ fn print_status(status: &GetSetupStatusResponse) {
         println!("initialized: false");
         return;
     }
-    let text = |value: &Option<String>| {
-        value
-            .as_deref()
-            .map(escape_control)
-            .unwrap_or_else(|| "none".to_string())
-    };
-    println!("setup_id: {}", text(&status.setup_id));
-    println!(
-        "member_id: {}",
-        status
-            .member_id
-            .map(|member| member.to_string())
-            .unwrap_or_else(|| "none".to_string())
-    );
+    println!("setup_id: {}", text(status.setup_id.as_deref()));
+    println!("member_id: {}", number(status.member_id));
     println!("role: {}", escape_control(&status.role));
     println!(
         "participant_phase: {}",
         escape_control(&status.participant_phase)
     );
     if status.coordinator_phase.is_some() {
-        println!("coordinator_phase: {}", text(&status.coordinator_phase));
+        println!(
+            "coordinator_phase: {}",
+            text(status.coordinator_phase.as_deref())
+        );
     }
     println!(
         "enrollments: {}/{} missing={}",
         status.enrolled_members.len(),
         status.member_count,
-        members(&status.missing_enrollments)
+        list(&status.missing_enrollments)
     );
     println!(
         "approvals: {}/{} missing={}",
         status.approved_members.len(),
         status.member_count,
-        members(&status.missing_approvals)
+        list(&status.missing_approvals)
     );
-    println!("proposal_hash: {}", text(&status.proposal_hash));
-    println!("manifest_hash: {}", text(&status.manifest_hash));
+    println!("proposal_hash: {}", text(status.proposal_hash.as_deref()));
+    println!("manifest_hash: {}", text(status.manifest_hash.as_deref()));
     if let Some(dkg) = status.dkg.as_ref() {
         println!(
             "dkg_phase: {} commitments={} reveals={} shares={} transcript_signatures={} final_confirmations={}/{} finalized_ready={}",
@@ -426,17 +408,6 @@ fn status_json(status: &GetSetupStatusResponse) -> serde_json::Value {
             "activated_at_unix": activation.activated_at_unix,
         })),
     })
-}
-
-fn members(members: &[u32]) -> String {
-    match members {
-        [] => "none".to_string(),
-        members => members
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-    }
 }
 
 fn read_invitation_file(path: &Path) -> Result<String> {

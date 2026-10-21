@@ -7,10 +7,8 @@
 //! the same process.
 
 use std::future::Future;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -22,15 +20,14 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::federation::{
-    FederationDkgCeremonyState, FederationSetupActivation, FederationSetupBitcoinNetwork,
-    FederationSetupInvitation, FederationSetupLocalRole, FederationSetupParticipantPhase,
-    FederationSetupProposalHash, FederationSetupProposalReview,
+    is_iroh_setup_url, FederationDkgCeremonyRecord, FederationSetupActivation,
+    FederationSetupBitcoinNetwork, FederationSetupInvitation, FederationSetupLocalRole,
+    FederationSetupParticipantPhase, FederationSetupProposalHash, FederationSetupProposalReview,
 };
 use cdk_common::mint_url::MintUrl;
 use cdk_mint_rpc::federation_setup as proto;
 use cdk_mint_rpc::{
-    DynFederationSetupProvider, FederationSetupError, FederationSetupProvider,
-    FederationSetupRPCServer,
+    DynFederationSetupProvider, FederationSetupProvider, FederationSetupRPCServer, ProviderError,
 };
 use tokio::sync::{Mutex, Notify};
 use tower::ServiceExt;
@@ -40,9 +37,10 @@ use crate::federation_dkg_status::FederationSetupDkgProgress;
 use crate::federation_setup_command::{
     activate_setup_with_db, approve_setup, build_certified_dkg_router,
     build_setup_coordinator_router, create_setup, current_unix_time, fetch_and_review_proposal,
-    join_setup, propose_setup, read_local_config, review_local_proposal, setup_status_with_db,
-    setup_url_policy, FederationSetupActivationResult, FederationSetupCommandStatus,
-    FederationSetupCreateParams, FederationSetupLocalConfig, HttpSetupCoordinator,
+    join_setup, parse_mint_url, propose_setup, read_local_config, refresh_certified_manifest,
+    review_local_proposal, serve_setup_router, setup_status_with_db, setup_url_policy,
+    FederationSetupActivationResult, FederationSetupCommandStatus, FederationSetupCreateParams,
+    FederationSetupLocalConfig, HttpSetupCoordinator, SetupServeEnd,
 };
 use crate::{config, BdkWalletPolicy};
 
@@ -51,8 +49,7 @@ const SETUP_CONFIG_FILE: &str = "setup.json";
 const SETUP_STATE_DIRECTORY: &str = "state";
 const SQLITE_DATABASE_FILE: &str = "cdk-mintd.sqlite";
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
-const ACTIVATION_RESPONSE_GRACE: Duration = Duration::from_millis(250);
-const LISTENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const WATCHER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKUP_WARNING: &str = "Before using real funds, create and verify an encrypted backup of this member's setup state, database, and activated private config.";
 
 /// How federation setup mode ended.
@@ -89,10 +86,8 @@ where
     create_private_dir(&setup_dir)?;
 
     #[cfg(feature = "iroh")]
-    let iroh = crate::iroh_runtime::initialize(settings, work_dir).await?;
-    #[cfg(feature = "iroh")]
-    let transport = match iroh.as_ref() {
-        Some(runtime) => cdk_axum::federation_transport_with_iroh_node(runtime.node.clone()),
+    let transport = match crate::iroh_runtime::initialize(settings, work_dir).await? {
+        Some(runtime) => cdk_axum::federation_transport_with_iroh_node(runtime.node),
         None => cdk_axum::default_federation_transport(),
     };
     #[cfg(not(feature = "iroh"))]
@@ -118,38 +113,22 @@ where
         config_service,
         bdk_wallet_policy,
         activated: Notify::new(),
-        activation_requested: AtomicBool::new(false),
     });
 
-    let router = mode.routes.router();
-    let (listener_stop, _) = tokio::sync::broadcast::channel::<()>(1);
-    let mut http_task = match settings.info.http_enabled {
+    let listener = match settings.info.http_enabled {
         true => {
             let address = format!(
                 "{}:{}",
                 settings.info.listen_host, settings.info.listen_port
             );
-            let listener = tokio::net::TcpListener::bind(&address)
-                .await
-                .with_context(|| format!("failed to bind the setup listener on {address}"))?;
-            let mut stop = listener_stop.subscribe();
-            let service = router
-                .clone()
-                .into_make_service_with_connect_info::<SocketAddr>();
-            Some(tokio::spawn(async move {
-                axum::serve(listener, service)
-                    .with_graceful_shutdown(async move {
-                        let _ = stop.recv().await;
-                    })
+            Some(
+                tokio::net::TcpListener::bind(&address)
                     .await
-            }))
+                    .with_context(|| format!("failed to bind the setup listener on {address}"))?,
+            )
         }
         false => None,
     };
-    #[cfg(feature = "iroh")]
-    let iroh_server = iroh
-        .as_ref()
-        .map(|runtime| cdk_iroh::IrohServer::start(runtime.node.clone(), router.clone()));
 
     let provider: DynFederationSetupProvider = Arc::new(SetupModeProvider { mode: mode.clone() });
     let mut rpc = FederationSetupRPCServer::new(&endpoint.address, endpoint.port, provider)?;
@@ -164,86 +143,37 @@ where
     let watcher_stop = Arc::new(Notify::new());
     let watcher = tokio::spawn(mode.clone().watch(watcher_stop.clone()));
 
-    let reason = {
-        let http_exit = async {
-            match http_task.as_mut() {
-                Some(task) => task.await,
-                None => std::future::pending().await,
+    // Activation keeps the Iroh endpoint bound so normal startup can reuse it.
+    let served = serve_setup_router(
+        listener,
+        mode.routes.router(),
+        mode.transport.clone(),
+        "federation setup listener",
+        async {
+            tokio::select! {
+                () = shutdown_signal => Ok(SetupServeEnd::Close),
+                () = mode.activated.notified() => Ok(SetupServeEnd::KeepIrohEndpoint),
             }
-        };
-        #[cfg(feature = "iroh")]
-        let iroh_exit = async {
-            match iroh_server.as_ref() {
-                Some(server) => server.finished().await,
-                None => std::future::pending().await,
-            }
-        };
-        #[cfg(not(feature = "iroh"))]
-        let iroh_exit = std::future::pending::<()>();
-        tokio::select! {
-            () = shutdown_signal => Ok(ExitReason::Shutdown),
-            () = mode.activated.notified() => Ok(ExitReason::Activated),
-            result = http_exit => Err(match result {
-                Ok(Ok(())) => anyhow!("setup HTTP listener exited unexpectedly"),
-                Ok(Err(error)) => anyhow!(error).context("setup HTTP listener failed"),
-                Err(error) => anyhow!(error).context("setup HTTP listener task failed"),
-            }),
-            () = iroh_exit => Err(anyhow!("setup Iroh listener exited unexpectedly")),
-        }
-    };
+        },
+    )
+    .await;
 
-    // Stop taking setup RPCs first so no operation starts while tearing down.
     if let Err(error) = rpc.stop().await {
         tracing::warn!(%error, "Federation setup RPC server did not stop cleanly");
     }
     watcher_stop.notify_one();
-    if tokio::time::timeout(LISTENER_SHUTDOWN_TIMEOUT, watcher)
+    if tokio::time::timeout(WATCHER_STOP_TIMEOUT, watcher)
         .await
         .is_err()
     {
         tracing::warn!("Federation setup watcher did not stop in time");
     }
     mode.stop_workers().await;
-    let _ = listener_stop.send(());
-    if let Some(task) = http_task {
-        match tokio::time::timeout(LISTENER_SHUTDOWN_TIMEOUT, task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => tracing::warn!(%error, "Setup HTTP listener failed on shutdown"),
-            Ok(Err(error)) => tracing::warn!(%error, "Setup HTTP listener task failed"),
-            Err(_) => tracing::warn!("Setup HTTP listener did not stop in time"),
-        }
-    }
 
-    let reason = reason?;
-    #[cfg(feature = "iroh")]
-    let iroh = match (reason, iroh_server) {
-        (ExitReason::Activated, Some(server)) => {
-            let node = server
-                .stop_serving()
-                .await
-                .context("failed to stop the setup Iroh listener")?;
-            Some(crate::iroh_runtime::MintdIrohRuntime { node })
-        }
-        (ExitReason::Shutdown, Some(server)) => {
-            if let Err(error) = server.shutdown().await {
-                tracing::warn!(%error, "Setup Iroh listener did not stop cleanly");
-            }
-            None
-        }
-        (_, None) => None,
-    };
-    #[cfg(not(feature = "iroh"))]
-    let iroh = crate::IrohHandover::default();
-    Ok(match reason {
-        ExitReason::Shutdown => SetupModeExit::Shutdown,
-        ExitReason::Activated => SetupModeExit::Activated { iroh },
+    Ok(match served? {
+        (SetupServeEnd::Close, _) => SetupModeExit::Shutdown,
+        (SetupServeEnd::KeepIrohEndpoint, iroh) => SetupModeExit::Activated { iroh },
     })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitReason {
-    Shutdown,
-    Activated,
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -317,10 +247,15 @@ struct SetupWorkers {
 
 struct RunningSetupDkg {
     services: Option<cdk_axum::RunningFederationServices>,
-    stopped: Arc<AtomicBool>,
 }
 
 impl RunningSetupDkg {
+    fn stopped(&self) -> bool {
+        self.services
+            .as_ref()
+            .is_some_and(cdk_axum::RunningFederationServices::is_stopped)
+    }
+
     async fn shutdown(self) {
         if let Some(services) = self.services {
             if let Err(error) = services.shutdown().await {
@@ -345,7 +280,6 @@ struct SetupMode {
     config_service: ConfigurationService,
     bdk_wallet_policy: BdkWalletPolicy,
     activated: Notify,
-    activation_requested: AtomicBool,
 }
 
 impl SetupMode {
@@ -374,13 +308,14 @@ impl SetupMode {
     }
 
     async fn dkg_ceremony_complete(&self) -> Result<bool> {
-        Ok(self
+        let ceremonies = self
             .database
             .get_federation_dkg_ceremonies()
             .await
-            .context("failed to read the DKG ceremony lifecycle")?
-            .iter()
-            .any(|record| record.state == FederationDkgCeremonyState::Complete))
+            .context("failed to read the DKG ceremony lifecycle")?;
+        Ok(FederationDkgCeremonyRecord::current_is_complete(
+            &ceremonies,
+        ))
     }
 
     /// Mount the creator's coordinator routes once.
@@ -399,7 +334,7 @@ impl SetupMode {
     /// before the ceremony completed.
     async fn ensure_dkg(&self, workers: &mut SetupWorkers) -> Result<()> {
         if let Some(dkg) = workers.dkg.as_ref() {
-            if !dkg.stopped.load(Ordering::SeqCst) || self.dkg_ceremony_complete().await? {
+            if !dkg.stopped() || self.dkg_ceremony_complete().await? {
                 return Ok(());
             }
             tracing::warn!("Setup DKG services stopped before the ceremony completed; restarting");
@@ -415,26 +350,10 @@ impl SetupMode {
             self.transport.clone(),
         )
         .await?;
-        let services = match built.services {
-            Some(services) => Some(
-                services
-                    .start()
-                    .await
-                    .context("failed to start setup DKG services")?,
-            ),
-            None => None,
-        };
-        let stopped = Arc::new(AtomicBool::new(false));
-        if let Some(services) = services.as_ref() {
-            let finished = services.stopped();
-            let flag = stopped.clone();
-            tokio::spawn(async move {
-                finished.await;
-                flag.store(true, Ordering::SeqCst);
-            });
-        }
         self.routes.set_dkg(Some(built.router));
-        workers.dkg = Some(RunningSetupDkg { services, stopped });
+        workers.dkg = Some(RunningSetupDkg {
+            services: built.services,
+        });
         tracing::info!(
             setup_id = %built.setup_id,
             member_id = %built.member_id,
@@ -464,8 +383,8 @@ impl SetupMode {
             return Ok(());
         }
         if phase == FederationSetupParticipantPhase::Approved && !config.manifest_path().exists() {
-            if let Err(error) = setup_status_with_db(
-                self.database.clone(),
+            if let Err(error) = refresh_certified_manifest(
+                &self.database,
                 &self.config_path,
                 &self.coordinator_client.0,
             )
@@ -505,8 +424,10 @@ impl SetupMode {
     }
 
     fn url_or_default(&self, value: Option<&str>, fallback: &str, label: &str) -> Result<MintUrl> {
-        let value = value.filter(|value| !value.is_empty()).unwrap_or(fallback);
-        MintUrl::from_str(value).with_context(|| format!("invalid {label}"))
+        parse_mint_url(
+            value.filter(|value| !value.is_empty()).unwrap_or(fallback),
+            label,
+        )
     }
 
     /// The federation API URL must differ from the public mint URL unless both
@@ -517,8 +438,8 @@ impl SetupMode {
         public_mint_url: &MintUrl,
     ) -> Result<MintUrl> {
         match value.filter(|value| !value.is_empty()) {
-            Some(value) => MintUrl::from_str(value).context("invalid federation API URL"),
-            None if public_mint_url.to_string().starts_with("iroh:") => Ok(public_mint_url.clone()),
+            Some(value) => parse_mint_url(value, "federation API URL"),
+            None if is_iroh_setup_url(public_mint_url) => Ok(public_mint_url.clone()),
             None => bail!(
                 "federation_api_url is required: it must differ from the public mint URL unless both are the same Iroh endpoint"
             ),
@@ -600,18 +521,6 @@ impl SetupMode {
             .context("failed to store the activated configuration")?;
         Ok(())
     }
-
-    /// Leave setup mode shortly after the activation response has been sent.
-    fn request_activation(self: &Arc<Self>) {
-        if self.activation_requested.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let mode = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(ACTIVATION_RESPONSE_GRACE).await;
-            mode.activated.notify_one();
-        });
-    }
 }
 
 struct SetupModeProvider {
@@ -623,7 +532,7 @@ impl FederationSetupProvider for SetupModeProvider {
     async fn create_setup(
         &self,
         request: proto::CreateSetupRequest,
-    ) -> Result<proto::CreateSetupResponse, FederationSetupError> {
+    ) -> Result<proto::CreateSetupResponse, ProviderError> {
         let mode = &self.mode;
         let mut workers = mode.workers.lock().await;
         let spec = mode
@@ -658,7 +567,7 @@ impl FederationSetupProvider for SetupModeProvider {
     async fn join_setup(
         &self,
         request: proto::JoinSetupRequest,
-    ) -> Result<proto::JoinSetupResponse, FederationSetupError> {
+    ) -> Result<proto::JoinSetupResponse, ProviderError> {
         let mode = &self.mode;
         let _workers = mode.workers.lock().await;
         let invitation = FederationSetupInvitation::from_str(request.invitation.trim())
@@ -697,7 +606,7 @@ impl FederationSetupProvider for SetupModeProvider {
     async fn propose_setup(
         &self,
         _request: proto::ProposeSetupRequest,
-    ) -> Result<proto::ProposeSetupResponse, FederationSetupError> {
+    ) -> Result<proto::ProposeSetupResponse, ProviderError> {
         let mode = &self.mode;
         let _workers = mode.workers.lock().await;
         let proposal = propose_setup(
@@ -715,7 +624,7 @@ impl FederationSetupProvider for SetupModeProvider {
     async fn review_proposal(
         &self,
         _request: proto::ReviewProposalRequest,
-    ) -> Result<proto::ReviewProposalResponse, FederationSetupError> {
+    ) -> Result<proto::ReviewProposalResponse, ProviderError> {
         let mode = &self.mode;
         let _workers = mode.workers.lock().await;
         let config = mode.require_local_config().map_err(failed_precondition)?;
@@ -729,7 +638,7 @@ impl FederationSetupProvider for SetupModeProvider {
                     .context("failed to load the local setup proposal")
                     .map_err(internal)?
                     .ok_or_else(|| {
-                        FederationSetupError::failed_precondition(
+                        ProviderError::failed_precondition(
                             "no setup proposal exists yet; propose the setup first",
                         )
                     })?;
@@ -758,7 +667,7 @@ impl FederationSetupProvider for SetupModeProvider {
     async fn approve_proposal(
         &self,
         request: proto::ApproveProposalRequest,
-    ) -> Result<proto::ApproveProposalResponse, FederationSetupError> {
+    ) -> Result<proto::ApproveProposalResponse, ProviderError> {
         let mode = &self.mode;
         let mut workers = mode.workers.lock().await;
         let hash = FederationSetupProposalHash::from_str(request.proposal_hash.trim())
@@ -791,7 +700,7 @@ impl FederationSetupProvider for SetupModeProvider {
     async fn get_setup_status(
         &self,
         _request: proto::GetSetupStatusRequest,
-    ) -> Result<proto::GetSetupStatusResponse, FederationSetupError> {
+    ) -> Result<proto::GetSetupStatusResponse, ProviderError> {
         let mode = &self.mode;
         let _workers = mode.workers.lock().await;
         let Some(config) = mode.local_config().map_err(internal)? else {
@@ -813,7 +722,7 @@ impl FederationSetupProvider for SetupModeProvider {
     async fn activate_setup(
         &self,
         _request: proto::ActivateSetupRequest,
-    ) -> Result<proto::ActivateSetupResponse, FederationSetupError> {
+    ) -> Result<proto::ActivateSetupResponse, ProviderError> {
         let mode = &self.mode;
         let _workers = mode.workers.lock().await;
         let result = activate_setup_with_db(
@@ -824,7 +733,8 @@ impl FederationSetupProvider for SetupModeProvider {
         .await
         .map_err(failed_precondition)?;
         mode.store_member_config(&result).await.map_err(internal)?;
-        mode.request_activation();
+        // Setup mode then stops the RPC server, which drains this response first.
+        mode.activated.notify_one();
         tracing::info!(
             setup_id = %result.setup_id,
             member_id = %result.member_id,
@@ -842,34 +752,23 @@ impl FederationSetupProvider for SetupModeProvider {
     }
 }
 
-fn invalid_argument(error: anyhow::Error) -> FederationSetupError {
-    FederationSetupError::invalid_argument(format!("{error:#}"))
+fn invalid_argument(error: anyhow::Error) -> ProviderError {
+    ProviderError::invalid_argument(format!("{error:#}"))
 }
 
-fn failed_precondition(error: anyhow::Error) -> FederationSetupError {
-    FederationSetupError::failed_precondition(format!("{error:#}"))
+fn failed_precondition(error: anyhow::Error) -> ProviderError {
+    ProviderError::failed_precondition(format!("{error:#}"))
 }
 
-fn internal(error: anyhow::Error) -> FederationSetupError {
-    FederationSetupError::internal(format!("{error:#}"))
+fn internal(error: anyhow::Error) -> ProviderError {
+    ProviderError::internal(format!("{error:#}"))
 }
 
+/// Parse a network name, accepting `mainnet` for `bitcoin` and any letter case.
 fn parse_network(value: &str) -> Result<FederationSetupBitcoinNetwork> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "bitcoin" | "mainnet" => Ok(FederationSetupBitcoinNetwork::Bitcoin),
-        "testnet" => Ok(FederationSetupBitcoinNetwork::Testnet),
-        "signet" => Ok(FederationSetupBitcoinNetwork::Signet),
-        "regtest" => Ok(FederationSetupBitcoinNetwork::Regtest),
-        other => bail!("unknown network {other:?}; expected bitcoin, testnet, signet, or regtest"),
-    }
-}
-
-const fn network_label(network: FederationSetupBitcoinNetwork) -> &'static str {
-    match network {
-        FederationSetupBitcoinNetwork::Bitcoin => "bitcoin",
-        FederationSetupBitcoinNetwork::Testnet => "testnet",
-        FederationSetupBitcoinNetwork::Signet => "signet",
-        FederationSetupBitcoinNetwork::Regtest => "regtest",
+        "mainnet" => Ok(FederationSetupBitcoinNetwork::Bitcoin),
+        name => Ok(FederationSetupBitcoinNetwork::from_str(name)?),
     }
 }
 
@@ -880,7 +779,7 @@ fn review_response(
         setup_id: review.setup_id.to_string(),
         proposed_federation_id: review.proposed_federation_id.to_string(),
         proposal_hash: review.proposal_hash.to_string(),
-        network: network_label(review.network).to_string(),
+        network: review.network.to_string(),
         member_count: u32::from(review.threshold_params.member_count),
         signature_threshold: u32::from(review.threshold_params.signature_threshold),
         consensus_threshold: u32::from(review.threshold_params.consensus_threshold),
@@ -986,6 +885,8 @@ fn activation_record(activation: FederationSetupActivation) -> proto::SetupActiv
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::routing::get;

@@ -139,10 +139,7 @@ write_member_config() {
         printf 'name = "gRPC setup member %s"\n' "$member"
         printf 'description = "Federation set up over the management RPC"\n\n'
         printf '[database]\nengine = "sqlite"\n\n'
-        printf '[[payment_backend]]\nbackend = "fakewallet"\nunit = "sat"\n'
-        printf 'min_mint = 1\nmax_mint = 500000\nmin_melt = 1\nmax_melt = 500000\n\n'
-        printf '[fake_wallet]\nsupported_units = ["sat"]\nfee_percent = 0.0\n'
-        printf 'reserve_fee_min = 1\nmin_delay_time = 0\nmax_delay_time = 0\n'
+        write_fakewallet_sections
         printf 'shared_incoming_payment_dir = "%s"\n\n' "$FED_DIR/fake-payment-network"
         printf '[mint_management_rpc]\nenabled = true\naddress = "127.0.0.1"\n'
         printf 'port = %s\nallow_insecure = true\n\n' "$(member_rpc_port "$member")"
@@ -199,14 +196,19 @@ write_operator_config() {
             printf '"%s",' "$(member_ticket "$peer")"
         done
         printf ']\n\n[database]\nengine = "sqlite"\n\n'
-        printf '[[payment_backend]]\nbackend = "fakewallet"\nunit = "sat"\n'
-        printf 'min_mint = 1\nmax_mint = 500000\nmin_melt = 1\nmax_melt = 500000\n\n'
-        printf '[fake_wallet]\nsupported_units = ["sat"]\nfee_percent = 0.0\n'
-        printf 'reserve_fee_min = 1\nmin_delay_time = 0\nmax_delay_time = 0\n'
+        write_fakewallet_sections
     } >"$output"
     chmod 600 "$output"
     "$MINTD" --work-dir "$FED_DIR/operator" config init --new-mint --file "$output" \
         >"$FED_DIR/operator-config-init.log"
+}
+
+# The fake payment backend shared by member and operator configs.
+write_fakewallet_sections() {
+    printf '[[payment_backend]]\nbackend = "fakewallet"\nunit = "sat"\n'
+    printf 'min_mint = 1\nmax_mint = 500000\nmin_melt = 1\nmax_melt = 500000\n\n'
+    printf '[fake_wallet]\nsupported_units = ["sat"]\nfee_percent = 0.0\n'
+    printf 'reserve_fee_min = 1\nmin_delay_time = 0\nmax_delay_time = 0\n'
 }
 
 start_member() {
@@ -233,24 +235,26 @@ wait_for_setup_rpc() {
 
 # Wait until every listed member (default: all) reports finalized_ready.
 wait_for_all_finalized() {
-    local attempt member all_ready
-    local members=("$@")
+    local attempt member
+    local members=("$@") waiting=()
     ((${#members[@]} > 0)) || members=($(seq 1 "$MEMBERS"))
+    waiting=("${members[@]}")
     for attempt in $(seq 1 "$STATUS_RETRIES"); do
-        all_ready=true
-        for member in "${members[@]}"; do
-            if ! setup_cli "$member" federation-setup status --json \
-                >"$(member_dir "$member")/status.json" 2>/dev/null; then
-                all_ready=false
+        # finalized_ready never goes back to false, so ready members drop out.
+        local still_waiting=()
+        for member in "${waiting[@]}"; do
+            if setup_cli "$member" federation-setup status --json \
+                >"$(member_dir "$member")/status.json" 2>/dev/null \
+                && [[ "$(jq -r '.dkg.finalized_ready // false' "$(member_dir "$member")/status.json")" == "true" ]]; then
                 continue
             fi
-            [[ "$(jq -r '.dkg.finalized_ready // false' "$(member_dir "$member")/status.json")" == "true" ]] \
-                || all_ready=false
+            still_waiting+=("$member")
         done
-        [[ "$all_ready" == "true" ]] && return 0
+        ((${#still_waiting[@]} == 0)) && return 0
+        waiting=("${still_waiting[@]}")
         sleep "$STATUS_SLEEP_SECONDS"
     done
-    for member in "${members[@]}"; do
+    for member in "${waiting[@]}"; do
         printf 'member %s: %s\n' "$member" \
             "$(jq -c '{participant_phase, dkg: .dkg.phase, error: .dkg.error}' "$(member_dir "$member")/status.json" 2>/dev/null || echo unknown)" >&2
     done
@@ -349,10 +353,10 @@ done
 
 cd "$REPO_ROOT"
 if [[ "$BUILD" == "1" ]]; then
-    mintd_features="federation-test-utils,sqlite"
-    [[ "$TRANSPORT" == "iroh" ]] && mintd_features="$mintd_features,iroh"
-    cargo build -p cdk-mintd --features "$mintd_features"
-    cargo build -p cdk-mint-rpc --bin cdk-mint-cli
+    # One build of both packages compiles the shared crates once.
+    features="cdk-mintd/federation-test-utils,cdk-mintd/sqlite"
+    [[ "$TRANSPORT" == "iroh" ]] && features="$features,cdk-mintd/iroh"
+    cargo build -p cdk-mintd -p cdk-mint-rpc --bins --features "$features"
 fi
 
 if [[ -z "$FED_DIR" ]]; then

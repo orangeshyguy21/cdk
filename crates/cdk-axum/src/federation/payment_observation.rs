@@ -1,6 +1,5 @@
 #[cfg(any(feature = "federation-bdk", feature = "federation-bark"))]
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +23,7 @@ use super::payment_schedule::{
     FederationPaymentAdvancement, FederationPaymentObservationSchedule,
     FederationPaymentObservationTrigger, FederationPaymentQuote, FederationPaymentQuoteKind,
 };
+use super::status_routes::PaymentReportDetail;
 use crate::MintState;
 
 const FEDERATION_STALE_PAYMENT_OBSERVATION_SECS: u64 = 15 * 60;
@@ -1390,57 +1390,16 @@ async fn submit_observation(
     Ok(true)
 }
 
+/// Build a report for every quote with payment observations.
+///
+/// Observations are read once and grouped by quote; the grouped records keep the
+/// per-quote query's order. With [`PaymentReportDetail::UnresolvedQuoteAges`]
+/// the quote's age is looked up only for unresolved reports, which are the only
+/// ones that can turn stale, so status and recommended action are unchanged and
+/// resolved reports omit their quote age.
 pub(super) async fn payment_observation_report_summaries(
     state: &MintState,
-) -> Result<Vec<FederationPaymentObservationReportSummary>, cdk::Error> {
-    let Some(runtime_config) = state.mint.federation_config() else {
-        return Ok(Vec::new());
-    };
-    let db = state.mint.localstore();
-    let mut report_keys = BTreeSet::new();
-    for record in db.get_all_federation_payment_observations().await? {
-        report_keys.insert((
-            record.observation.context(),
-            record.observation.quote().to_string(),
-        ));
-    }
-
-    let mut reports = Vec::with_capacity(report_keys.len());
-    let now = current_unix_time();
-    for (context, quote) in report_keys {
-        let required = runtime_config
-            .public_config()
-            .payment_verification_policy(context)
-            .required_matching_observations();
-        let observations = db
-            .get_federation_payment_observations(context, &quote)
-            .await?;
-        let report = FederationPaymentObservationReport::from_records(
-            context,
-            &quote,
-            required,
-            &observations,
-        );
-        let quote_age_secs =
-            payment_observation_quote_age_secs(state, context, &quote, now).await?;
-        reports.push(
-            report
-                .summary_with_quote_age(quote_age_secs, FEDERATION_STALE_PAYMENT_OBSERVATION_SECS),
-        );
-    }
-
-    Ok(reports)
-}
-
-/// Build the same reports as [`payment_observation_report_summaries`] with
-/// fewer database reads, for management status requests.
-///
-/// Observations are read once and grouped in memory instead of once per quote,
-/// and the quote's age is looked up only for unresolved reports. Only those can
-/// turn stale, so status and recommended action match the full build; resolved
-/// reports omit their quote age.
-pub(super) async fn payment_observation_report_summaries_with_unresolved_ages(
-    state: &MintState,
+    detail: PaymentReportDetail,
 ) -> Result<Vec<FederationPaymentObservationReportSummary>, cdk::Error> {
     let Some(runtime_config) = state.mint.federation_config() else {
         return Ok(Vec::new());
@@ -1466,9 +1425,9 @@ pub(super) async fn payment_observation_report_summaries_with_unresolved_ages(
             .required_matching_observations();
         let report =
             FederationPaymentObservationReport::from_records(context, &quote, required, &records);
-        let quote_age_secs = match report.is_unresolved() {
-            true => payment_observation_quote_age_secs(state, context, &quote, now).await?,
-            false => None,
+        let quote_age_secs = match (detail, report.is_unresolved()) {
+            (PaymentReportDetail::UnresolvedQuoteAges, false) => None,
+            _ => payment_observation_quote_age_secs(state, context, &quote, now).await?,
         };
         reports.push(
             report

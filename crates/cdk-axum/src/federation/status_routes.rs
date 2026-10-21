@@ -15,7 +15,6 @@ use tracing::instrument;
 
 use crate::MintState;
 
-use super::payment_observation::payment_observation_report_summaries_with_unresolved_ages;
 use super::{
     admit_private_request, anyhow_response, cdk_error_response, federation_error_status,
     local_peer_status, local_peer_status_with_materialized_rows,
@@ -179,12 +178,8 @@ pub(super) async fn build_local_status(
     };
     let sync_status = state.federation_sync_status().await.unwrap_or_default();
     let checkpoint = federation_checkpoint_status(state).await?;
-    let payment_observation_reports = match options.payment_reports {
-        PaymentReportDetail::Full => payment_observation_report_summaries(state).await?,
-        PaymentReportDetail::UnresolvedQuoteAges => {
-            payment_observation_report_summaries_with_unresolved_ages(state).await?
-        }
-    };
+    let payment_observation_reports =
+        payment_observation_report_summaries(state, options.payment_reports).await?;
     let pending_mempool_items = state.federation_pending_mempool_len().await;
     let notification_stats = state.federation_operation_notification_stats();
     let aleph_bft_status = state.federation_aleph_bft_status().await;

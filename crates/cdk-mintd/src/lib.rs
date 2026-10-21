@@ -3543,10 +3543,6 @@ async fn load_stored_settings(work_dir: &Path, args: &CLIArgs) -> Result<config:
 }
 
 /// Runs mintd using only the configuration stored in its primary database.
-#[cfg_attr(
-    not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
-    allow(clippy::never_loop)
-)]
 pub async fn run_mintd_from_database(
     work_dir: &Path,
     db_password: Option<String>,
@@ -3559,69 +3555,32 @@ pub async fn run_mintd_from_database(
     let bootstrap = load_database_bootstrap_settings()?;
     let (localstore, keystore, kv, configuration_store) =
         initial_setup(work_dir, &bootstrap, db_password.clone()).await?;
-    #[cfg_attr(
-        not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
-        allow(unused_mut)
-    )]
-    let mut service = configuration_service(configuration_store.clone(), &bootstrap);
-    #[cfg_attr(
-        not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
-        allow(unused_mut)
-    )]
-    let mut startup = service.startup().await?;
+    let service = configuration_service(configuration_store.clone(), &bootstrap);
+    let startup = service.startup().await?;
     let guard = if enable_logging {
         setup_tracing(work_dir, &startup.resolved.settings.info.logging)?
     } else {
         None
     };
-    #[cfg_attr(
-        not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")),
-        allow(unused_mut)
-    )]
-    let mut iroh_handover = IrohHandover::default();
 
-    // Setup mode runs until activation, then the loop restarts from the newly
-    // applied configuration as a normal federation member in this process.
-    let result = loop {
+    let result = async {
+        let Some((service, startup, iroh_handover)) = run_setup_mode_if_enabled(
+            work_dir,
+            &localstore,
+            &configuration_store,
+            &bootstrap,
+            service,
+            startup,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         config_service::require_existing_bdk_wallet(
             &startup.resolved.settings,
             work_dir,
             startup.bdk_wallet_policy,
         )?;
-
-        #[cfg(feature = "federation")]
-        if federation_setup_mode_enabled(&startup.resolved.settings) {
-            #[cfg(all(feature = "management-rpc", feature = "sqlite"))]
-            {
-                let exit = federation_setup_mode::run_federation_setup_mode(
-                    work_dir,
-                    &startup.resolved.settings,
-                    localstore.clone(),
-                    service,
-                    startup.bdk_wallet_policy,
-                    shutdown_signal(),
-                )
-                .await;
-                match exit {
-                    Ok(federation_setup_mode::SetupModeExit::Activated { iroh }) => {
-                        tracing::info!(
-                            "Federation setup activated; starting as a federation member"
-                        );
-                        iroh_handover = iroh;
-                        service = configuration_service(configuration_store.clone(), &bootstrap);
-                        startup = service.startup().await?;
-                        continue;
-                    }
-                    Ok(federation_setup_mode::SetupModeExit::Shutdown) => break Ok(()),
-                    Err(error) => break Err(error),
-                }
-            }
-            #[cfg(not(all(feature = "management-rpc", feature = "sqlite")))]
-            break Err(anyhow!(
-                "federation setup mode requires the `management-rpc` and `sqlite` features"
-            ));
-        }
-
         let validated_signing_source = Some(ValidatedSigningSource {
             expected_pubkey: startup.signing_identity.pubkey,
             remote_signatory: startup
@@ -3634,8 +3593,7 @@ pub async fn run_mintd_from_database(
             startup.revision,
         ));
         let settings = startup.resolved.settings;
-
-        break run_mintd_with_database_and_shutdown(
+        run_mintd_with_database_and_shutdown(
             work_dir,
             &settings,
             localstore,
@@ -3649,8 +3607,9 @@ pub async fn run_mintd_from_database(
             validated_signing_source,
             iroh_handover,
         )
-        .await;
-    };
+        .await
+    }
+    .await;
 
     if let Some(guard) = guard {
         tracing::info!("Shutting down logging worker thread");
@@ -3660,6 +3619,61 @@ pub async fn run_mintd_from_database(
 
     tracing::info!("Mintd shutdown");
     result
+}
+
+/// Run federation setup mode when the stored configuration asks for it.
+///
+/// Returns the configuration to start the mint from: the given one when setup
+/// mode is off, the newly applied one after activation, or `None` when the
+/// daemon was stopped during setup.
+async fn run_setup_mode_if_enabled(
+    work_dir: &Path,
+    localstore: &DynMintDatabase,
+    configuration_store: &Arc<dyn KVStoreCompareAndSwap<Err = cdk_database::Error> + Send + Sync>,
+    bootstrap: &config::Settings,
+    service: config_service::ConfigurationService,
+    startup: config_service::StartupConfiguration,
+) -> Result<
+    Option<(
+        config_service::ConfigurationService,
+        config_service::StartupConfiguration,
+        IrohHandover,
+    )>,
+> {
+    #[cfg(all(feature = "federation", feature = "management-rpc", feature = "sqlite"))]
+    if federation_setup_mode_enabled(&startup.resolved.settings) {
+        config_service::require_existing_bdk_wallet(
+            &startup.resolved.settings,
+            work_dir,
+            startup.bdk_wallet_policy,
+        )?;
+        let exit = federation_setup_mode::run_federation_setup_mode(
+            work_dir,
+            &startup.resolved.settings,
+            localstore.clone(),
+            service,
+            startup.bdk_wallet_policy,
+            shutdown_signal(),
+        )
+        .await?;
+        let federation_setup_mode::SetupModeExit::Activated { iroh } = exit else {
+            return Ok(None);
+        };
+        tracing::info!("Federation setup activated; starting as a federation member");
+        let service = configuration_service(configuration_store.clone(), bootstrap);
+        let startup = service.startup().await?;
+        return Ok(Some((service, startup, iroh)));
+    }
+    #[cfg(all(
+        feature = "federation",
+        not(all(feature = "management-rpc", feature = "sqlite"))
+    ))]
+    if federation_setup_mode_enabled(&startup.resolved.settings) {
+        bail!("federation setup mode requires the `management-rpc` and `sqlite` features");
+    }
+    #[cfg(not(all(feature = "federation", feature = "management-rpc", feature = "sqlite")))]
+    let _ = (work_dir, localstore, configuration_store, bootstrap);
+    Ok(Some((service, startup, IrohHandover::default())))
 }
 
 #[cfg(test)]
