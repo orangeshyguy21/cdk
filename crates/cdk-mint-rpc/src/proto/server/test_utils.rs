@@ -76,6 +76,7 @@ pub(super) async fn create_test_rpc_server_with_payment_delay(payment_delay: u64
         mutation_guard: None,
         allow_mint_quote_payment_override: false,
         wallet_info_provider: None,
+        federation_status_provider: None,
         shutdown: Arc::new(Notify::new()),
         handle: None,
     }

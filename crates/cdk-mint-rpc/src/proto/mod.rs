@@ -1,5 +1,10 @@
 //! CDK mint proto types
 
+/// Read-only status service for a running federation member
+pub mod federation {
+    tonic::include_proto!("cdk_mint_federation_v1");
+}
+
 /// Federation setup service, served before a mint exists
 pub mod federation_setup {
     tonic::include_proto!("cdk_mint_federation_setup_v1");

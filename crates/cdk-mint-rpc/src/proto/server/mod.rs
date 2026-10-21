@@ -12,6 +12,7 @@ use tokio::time::Duration;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::Status;
 
+mod federation;
 mod federation_setup;
 mod info;
 mod keyset;
@@ -21,12 +22,13 @@ mod quote;
 mod test_utils;
 mod wallet;
 
+use crate::federation::federation_service_server::FederationServiceServer;
 use crate::info::mint_info_service_server::MintInfoServiceServer;
 use crate::keyset::keyset_service_server::KeysetServiceServer;
 use crate::payment_method::payment_method_service_server::PaymentMethodServiceServer;
 use crate::quote::quote_service_server::QuoteServiceServer;
 use crate::wallet::wallet_service_server::WalletServiceServer;
-use crate::DynWalletInfoProvider;
+use crate::{DynFederationStatusProvider, DynWalletInfoProvider};
 
 pub use self::federation_setup::FederationSetupRPCServer;
 
@@ -71,6 +73,7 @@ pub struct MintRPCServer {
     mutation_guard: Option<Arc<dyn MintMutationGuard>>,
     allow_mint_quote_payment_override: bool,
     wallet_info_provider: Option<DynWalletInfoProvider>,
+    federation_status_provider: Option<DynFederationStatusProvider>,
     shutdown: Arc<Notify>,
     handle: Option<Arc<JoinHandle<Result<(), Error>>>>,
 }
@@ -89,6 +92,7 @@ impl MintRPCServer {
             mutation_guard: None,
             allow_mint_quote_payment_override: false,
             wallet_info_provider: None,
+            federation_status_provider: None,
             shutdown: Arc::new(Notify::new()),
             handle: None,
         })
@@ -128,6 +132,18 @@ impl MintRPCServer {
         self
     }
 
+    /// Configures the read-only federation status provider.
+    ///
+    /// Without one, every federation status RPC fails with
+    /// `FAILED_PRECONDITION`.
+    pub fn with_federation_status_provider(
+        mut self,
+        provider: DynFederationStatusProvider,
+    ) -> Self {
+        self.federation_status_provider = Some(provider);
+        self
+    }
+
     /// Starts the RPC server
     ///
     /// # Arguments
@@ -145,7 +161,8 @@ impl MintRPCServer {
             .add_service(KeysetServiceServer::new(self.clone()))
             .add_service(PaymentMethodServiceServer::new(self.clone()))
             .add_service(QuoteServiceServer::new(self.clone()))
-            .add_service(WalletServiceServer::new(self.clone()));
+            .add_service(WalletServiceServer::new(self.clone()))
+            .add_service(FederationServiceServer::new(self.clone()));
 
         let shutdown = self.shutdown.clone();
         let addr = self.socket_addr;

@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(".", "#[allow(missing_docs)]")
         .compile_protos(
             &[
+                "src/proto/federation.proto",
                 "src/proto/federation_setup.proto",
                 "src/proto/info.proto",
                 "src/proto/keyset.proto",

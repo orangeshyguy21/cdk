@@ -28,6 +28,7 @@ versioned package under `src/proto/` and is served on the same port.
 | `QuoteService` | `cdk_mint_quote_v1` | Quote time-to-live settings and mint quote state overrides |
 | `WalletService` | `cdk_mint_wallet_v1` | On-chain wallet balance, deposit addresses, and transactions |
 | `FederationSetupService` | `cdk_mint_federation_setup_v1` | Federation setup: create or join, propose, review, approve, status, and activate. Served on its own while the daemon is in setup mode, before any mint exists |
+| `FederationService` | `cdk_mint_federation_v1` | Read-only status of a running federation member: federation config, local status, every member's status with a digest comparison, and custody. Fails with `FAILED_PRECONDITION` unless the daemon runs as a federation member |
 
 Each package name carries its API version (`_v1`). Incompatible changes go in a
 new package version, served alongside the old one.
@@ -64,6 +65,12 @@ cdk-mint-cli rotate-next-keyset --unit sat
 
 # Point at a specific mint
 cdk-mint-cli --addr https://127.0.0.1:8086 get-info
+
+# Read a running federation member's status
+cdk-mint-cli federation info
+cdk-mint-cli federation status --json
+cdk-mint-cli federation members --member 2 --member 3
+cdk-mint-cli federation custody
 ```
 
 ### TLS
