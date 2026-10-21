@@ -15,6 +15,11 @@
 # APPROVE_ORDER=creator-last approves members 2..N before the creator
 # (default creator-first), and ACTIVATE_EARLY=1 activates member 1 as soon as
 # its own status reports finalized_ready, before the others finish.
+#
+# Once the federation runs, every member is read through `cdk-mint-cli
+# federation`: the federation ids must match, every member must reach every
+# other one, and their digests must agree. The last member is then stopped and
+# must show as unreachable while the others stay healthy.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -267,6 +272,65 @@ wait_for_running_member() {
     die "member $member did not come back as a running federation member"
 }
 
+# Wait until a member sees every member reachable except the optional stopped
+# one, every reachable member ready, and all their digests in agreement.
+wait_for_member_statuses() {
+    local member="$1" stopped="${2:-0}" attempt output
+    output="$(member_dir "$member")/federation-members.json"
+    for attempt in $(seq 1 "$STATUS_RETRIES"); do
+        if setup_cli "$member" federation members --json >"$output" 2>/dev/null \
+            && jq -e --argjson members "$MEMBERS" --argjson stopped "$stopped" \
+                --arg federation_id "$federation_id" '
+                (.members | length) == $members
+                and all(.members[];
+                    if .member_id == $stopped then (.reachable | not) and (.error // "") != ""
+                    else .reachable
+                        and .status.federation_id == $federation_id
+                        and .status.sync.ready
+                    end)
+                and ([.members[] | select(.local) | .member_id] | length) == 1
+                and .digest_agreement.state == "converged"
+                and (.digest_agreement.compared_members | length)
+                    == ($members - (if $stopped > 0 then 1 else 0 end))' \
+                "$output" >/dev/null; then
+            return 0
+        fi
+        sleep "$STATUS_SLEEP_SECONDS"
+    done
+    jq -c '{members: [.members[] | {member_id, reachable, error, sync: .status.sync.state}], digest_agreement}' \
+        "$output" >&2 2>/dev/null || true
+    die "member $member did not see the expected member statuses"
+}
+
+check_federation_status_rpcs() {
+    local member info status
+    for member in $(seq 1 "$MEMBERS"); do
+        info="$(member_dir "$member")/federation-info.json"
+        status="$(member_dir "$member")/federation-status.json"
+        setup_cli "$member" federation info --json >"$info"
+        setup_cli "$member" federation status --json >"$status"
+        setup_cli "$member" federation custody --json >"$(member_dir "$member")/federation-custody.json"
+        setup_cli "$member" federation info >"$(member_dir "$member")/federation-info.log"
+        [[ "$(jq -r '.federation_id' "$info")" == "$federation_id" ]] \
+            || die "member $member reports another federation id"
+        [[ "$(jq -r '.config_digest' "$info")" == "$config_digest" ]] \
+            || die "member $member reports another config digest"
+        [[ "$(jq -r '.local_member_id' "$info")" == "$member" ]] \
+            || die "member $member reports another local member id"
+        [[ "$(jq -r '.members | length' "$info")" == "$MEMBERS" ]] \
+            || die "member $member reports another member count"
+        [[ "$(jq -r '.member_id' "$status")" == "$member" ]] \
+            || die "member $member local status names another member"
+        [[ "$(jq -r '.federation_id' "$status")" == "$federation_id" ]] \
+            || die "member $member local status names another federation"
+        [[ "$(jq -r '.checkpoint.audit_mismatch' "$status")" == "false" ]] \
+            || die "member $member reports a digest alert"
+    done
+    for member in $(seq 1 "$MEMBERS"); do
+        wait_for_member_statuses "$member"
+    done
+}
+
 activate_member() {
     setup_cli "$1" federation-setup activate >"$(member_dir "$1")/activate.log" \
         2>"$(member_dir "$1")/activate-warning.log"
@@ -398,5 +462,24 @@ printf 'Running paid mint/swap/melt smoke operations...\n'
     --quote-sleep-ms 100 \
     --operation-timeout-seconds 900 \
     >"$FED_DIR/smoke.log"
+
+printf 'Reading federation status from every member over gRPC...\n'
+setup_cli 1 federation info --json >"$(member_dir 1)/federation-info.json"
+federation_id="$(jq -r '.federation_id' "$(member_dir 1)/federation-info.json")"
+config_digest="$(jq -r '.config_digest' "$(member_dir 1)/federation-info.json")"
+[[ -n "$federation_id" && "$federation_id" != "null" ]] || die "member 1 reports no federation id"
+check_federation_status_rpcs
+printf 'Every member reaches every other member and their digests agree (%s payment reports on member 1)\n' \
+    "$(jq -r '.payment_observations.total_reports' "$(member_dir 1)/federation-status.json")"
+
+stopped_member="$MEMBERS"
+printf 'Stopping member %s; the others must report it unreachable...\n' "$stopped_member"
+kill -INT "${PIDS[$stopped_member]}" 2>/dev/null || true
+wait "${PIDS[$stopped_member]}" 2>/dev/null || true
+unset 'PIDS[$stopped_member]'
+for member in $(seq 1 "$((MEMBERS - 1))"); do
+    wait_for_member_statuses "$member" "$stopped_member"
+done
+printf 'Members 1..%s report member %s unreachable and stay healthy\n' "$((MEMBERS - 1))" "$stopped_member"
 
 printf 'federation setup over gRPC passed: %s\n' "$FED_DIR"
