@@ -13,6 +13,7 @@ use cdk_common::federation::{
 use cdk_http_client::Transport;
 
 use crate::cli::{CLIArgs, FederationStatusArgs};
+use crate::federation_digest_agreement::{DigestAgreement, DigestConflictKind};
 
 pub(crate) async fn run_status_command(
     cli_args: &CLIArgs,
@@ -386,7 +387,7 @@ fn wallet_operator_status_line(
     )
 }
 
-fn encode_commitment(commitment: &[u8; 32]) -> String {
+pub(crate) fn encode_commitment(commitment: &[u8; 32]) -> String {
     commitment
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -718,21 +719,17 @@ fn ensure_statuses_ready(statuses: &[FederationLocalStatusResponse]) -> Result<(
 }
 
 fn ensure_statuses_converged(statuses: &[FederationLocalStatusResponse]) -> Result<()> {
-    ensure_statuses_have_application_digest(statuses)?;
-    let Some(first) = statuses.first() else {
-        return Ok(());
-    };
-    for status in statuses.iter().skip(1) {
-        if !status
-            .peer_status
-            .has_same_application_state(&first.peer_status)
-        {
-            bail!(
-                "federation status is not converged: member {} differs from member {} in operation height, AlephBFT session, order digest, or application digest",
-                status.peer_status.member_id,
-                first.peer_status.member_id,
-            );
-        }
+    let agreement = DigestAgreement::from_statuses(statuses);
+    ensure_statuses_have_application_digest(&agreement)?;
+    if let (Some(member), Some(reference)) = (
+        agreement.differing_members.first(),
+        agreement.reference_member,
+    ) {
+        bail!(
+            "federation status is not converged: member {} differs from member {} in operation height, AlephBFT session, order digest, or application digest",
+            member,
+            reference,
+        );
     }
 
     Ok(())
@@ -768,67 +765,45 @@ fn ensure_statuses_operation_lag(
 }
 
 fn ensure_statuses_no_digest_alerts(statuses: &[FederationLocalStatusResponse]) -> Result<()> {
-    ensure_statuses_have_application_digest(statuses)?;
-    for status in statuses {
-        if status.has_digest_alert() {
-            bail!(
-                "federation member {} reports digest alert: sync={} message={}",
-                status.peer_status.member_id,
-                status.sync_state,
-                redact_federation_operator_message(&status.sync_message)
-            );
-        }
+    let agreement = DigestAgreement::from_statuses(statuses);
+    ensure_statuses_have_application_digest(&agreement)?;
+    if let Some(status) = agreement.digest_alert_members.first().and_then(|member| {
+        statuses
+            .iter()
+            .find(|status| status.peer_status.member_id == *member)
+    }) {
+        bail!(
+            "federation member {} reports digest alert: sync={} message={}",
+            status.peer_status.member_id,
+            status.sync_state,
+            redact_federation_operator_message(&status.sync_message)
+        );
     }
 
-    for (index, status) in statuses.iter().enumerate() {
-        for other in statuses.iter().skip(index + 1) {
-            if status.peer_status.operation_count != other.peer_status.operation_count {
-                continue;
-            }
-            if status.peer_status.latest_order_digest != other.peer_status.latest_order_digest {
-                bail!(
-                    "federation digest alert: members {} and {} disagree on order digest at operation count {}",
-                    status.peer_status.member_id,
-                    other.peer_status.member_id,
-                    status.peer_status.operation_count
-                );
-            }
-            if status.peer_status.latest_audited_checkpoint_id
-                == other.peer_status.latest_audited_checkpoint_id
-                && status.peer_status.materialized_state_digest
-                    != other.peer_status.materialized_state_digest
-            {
-                bail!(
-                    "federation digest alert: members {} and {} disagree on the same checkpoint audit at operation count {}",
-                    status.peer_status.member_id,
-                    other.peer_status.member_id,
-                    status.peer_status.operation_count
-                );
-            }
-            if status.peer_status.application_digest != other.peer_status.application_digest {
-                bail!(
-                    "federation digest alert: members {} and {} disagree on application digest at operation count {}",
-                    status.peer_status.member_id,
-                    other.peer_status.member_id,
-                    status.peer_status.operation_count
-                );
-            }
-        }
+    if let Some(conflict) = agreement.conflicts.first() {
+        let disagreement = match conflict.kind {
+            DigestConflictKind::OrderDigest => "order digest",
+            DigestConflictKind::CheckpointAudit => "the same checkpoint audit",
+            DigestConflictKind::ApplicationDigest => "application digest",
+        };
+        bail!(
+            "federation digest alert: members {} and {} disagree on {} at operation count {}",
+            conflict.first,
+            conflict.second,
+            disagreement,
+            conflict.operation_count
+        );
     }
 
     Ok(())
 }
 
-fn ensure_statuses_have_application_digest(
-    statuses: &[FederationLocalStatusResponse],
-) -> Result<()> {
-    for status in statuses {
-        if status.peer_status.application_digest.is_none() {
-            bail!(
-                "federation member {} omitted its application digest",
-                status.peer_status.member_id
-            );
-        }
+fn ensure_statuses_have_application_digest(agreement: &DigestAgreement) -> Result<()> {
+    if let Some(member) = agreement.missing_application_digest_members.first() {
+        bail!(
+            "federation member {} omitted its application digest",
+            member
+        );
     }
     Ok(())
 }

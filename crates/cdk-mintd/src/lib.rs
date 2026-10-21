@@ -85,6 +85,8 @@ mod federation_checkpoint_audit;
 #[cfg(feature = "federation")]
 mod federation_configuration;
 #[cfg(feature = "federation")]
+mod federation_digest_agreement;
+#[cfg(feature = "federation")]
 mod federation_digest_compare;
 #[cfg(feature = "federation")]
 mod federation_dkg_status;
