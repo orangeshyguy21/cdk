@@ -74,6 +74,7 @@ pub(crate) mod runtime_components;
 pub(crate) mod services;
 mod setup;
 pub(crate) mod state;
+mod status_handle;
 mod status_routes;
 mod sync_config;
 mod sync_loop;
@@ -154,7 +155,9 @@ pub use self::setup::{
     FederationSetupCoordinatorServiceConfig, FederationSetupHttpClient, FederationSetupHttpError,
     FederationSetupHttpErrorCode,
 };
+pub use self::status_handle::{FederationMemberLocalStatus, FederationStatusHandle};
 use self::status_routes::{post_local_status, post_status};
+pub use self::status_routes::{FederationCustodyStatus, FederationLocalStatusError};
 #[cfg(test)]
 use self::sync_config::FederationPeerReconnectBackoff;
 #[cfg(test)]
@@ -501,10 +504,39 @@ pub(crate) async fn get_public_config(
     Ok(response)
 }
 
+/// Private REST admission could not be granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PrivateRestAdmissionError {
+    /// Every admission permit is in use.
+    #[error("federation private REST inbound queue is full")]
+    Full,
+    /// Admission was closed during shutdown.
+    #[error("federation private REST inbound admission is closed")]
+    Closed,
+}
+
+impl PrivateRestAdmissionError {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::Full => StatusCode::TOO_MANY_REQUESTS,
+            Self::Closed => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
 fn acquire_private_rest_admission(
     state: &MintState,
     kind: FederationRestMessageKind,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Response> {
+    try_acquire_private_rest_admission(state, kind)
+        .map_err(|error| (error.status(), error.to_string()).into_response())
+}
+
+/// Take one permit from the bounded private REST admission, when it exists.
+pub(crate) fn try_acquire_private_rest_admission(
+    state: &MintState,
+    kind: FederationRestMessageKind,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, PrivateRestAdmissionError> {
     let Some(admission) = state.federation.private_rest_admission() else {
         return Ok(None);
     };
@@ -515,22 +547,14 @@ fn acquire_private_rest_admission(
                 request_kind = ?kind,
                 "Federation private REST inbound queue is full"
             );
-            Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "federation private REST inbound queue is full",
-            )
-                .into_response())
+            Err(PrivateRestAdmissionError::Full)
         }
         Err(tokio::sync::TryAcquireError::Closed) => {
             tracing::error!(
                 request_kind = ?kind,
                 "Federation private REST inbound admission is closed"
             );
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "federation private REST inbound admission is closed",
-            )
-                .into_response())
+            Err(PrivateRestAdmissionError::Closed)
         }
     }
 }

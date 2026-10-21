@@ -1,23 +1,25 @@
-#[cfg(feature = "prometheus")]
 use std::collections::BTreeMap;
 
 use axum::extract::{Json, State};
-use axum::response::Response;
-#[cfg(feature = "federation-bdk")]
-use cdk::federation::FederationWalletRecoveryStatus;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use cdk::federation::{
-    FederationAlephBftBackupStatus, FederationCheckpointKind, FederationCheckpointQuorumSummary,
-    FederationCheckpointStatus, FederationCheckpointSummary, FederationLocalStatusResponse,
-    FederationPeerStatus, FederationPeerStatusRequest, FederationRestMessageKind,
-    FederationSignedRequest, FEDERATION_REST_API_VERSION,
+    redact_federation_operator_message, FederationAlephBftBackupStatus, FederationCheckpointKind,
+    FederationCheckpointQuorumSummary, FederationCheckpointStatus, FederationCheckpointSummary,
+    FederationLocalStatusResponse, FederationOnchainWalletStatus, FederationPeerStatus,
+    FederationPeerStatusRequest, FederationRestMessageKind, FederationSignedRequest,
+    FederationWalletLivenessStatus, FederationWalletOperatorStatus, FederationWalletRecoveryStatus,
+    MemberId, FEDERATION_REST_API_VERSION,
 };
 use tracing::instrument;
 
 use crate::MintState;
 
+use super::payment_observation::payment_observation_report_summaries_with_unresolved_ages;
 use super::{
-    admit_private_request, anyhow_response, cdk_error_response, local_peer_status,
-    local_peer_status_with_materialized_rows, payment_observation_report_summaries,
+    admit_private_request, anyhow_response, cdk_error_response, federation_error_status,
+    local_peer_status, local_peer_status_with_materialized_rows,
+    payment_observation_report_summaries, PrivateRestAdmissionError,
 };
 
 #[instrument(skip_all)]
@@ -52,23 +54,137 @@ pub(super) async fn post_local_status(
             verified.sequence(),
         )
         .await;
-    let (peer_status, materialized_state_rows) = if payload.payload.include_materialized_rows {
-        local_peer_status_with_materialized_rows(&state)
-            .await
-            .map_err(anyhow_response)?
+    let options = LocalStatusOptions {
+        include_materialized_rows: payload.payload.include_materialized_rows,
+        payment_reports: PaymentReportDetail::Full,
+    };
+    let response = build_local_status(&state, options)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    Ok(Json(response))
+}
+
+/// Why a member's local status could not be built.
+///
+/// The private REST route answers with [`Self::http_status`]; management
+/// interfaces can map the same value onto their own status codes.
+#[derive(Debug, thiserror::Error)]
+pub enum FederationLocalStatusError {
+    /// The mint is not running as a federation member.
+    #[error("mint is not configured as a federation member")]
+    NotConfigured,
+    /// Every private REST admission permit is in use.
+    #[error("federation private REST inbound queue is full")]
+    AdmissionFull,
+    /// Private REST admission was closed during shutdown.
+    #[error("federation private REST inbound admission is closed")]
+    AdmissionClosed,
+    /// Reading mint or federation state failed.
+    #[error(transparent)]
+    Mint(#[from] cdk::Error),
+    /// Any other failure.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl FederationLocalStatusError {
+    /// HTTP status the private REST route answers with for this error.
+    pub fn http_status(&self) -> StatusCode {
+        match self {
+            Self::NotConfigured => StatusCode::NOT_FOUND,
+            Self::AdmissionFull => PrivateRestAdmissionError::Full.status(),
+            Self::AdmissionClosed => PrivateRestAdmissionError::Closed.status(),
+            Self::Mint(cdk::Error::Federation(error)) => federation_error_status(error),
+            Self::Mint(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Message safe to show a caller: internal failures are hidden and other
+    /// details have secrets and paths removed.
+    pub fn public_message(&self) -> String {
+        match (self.http_status(), self) {
+            (StatusCode::INTERNAL_SERVER_ERROR, _) => "federation internal error".to_string(),
+            (_, Self::Mint(cdk::Error::Federation(error))) => {
+                redact_federation_operator_message(&error.to_string())
+            }
+            (_, error) => error.to_string(),
+        }
+    }
+}
+
+impl From<PrivateRestAdmissionError> for FederationLocalStatusError {
+    fn from(error: PrivateRestAdmissionError) -> Self {
+        match error {
+            PrivateRestAdmissionError::Full => Self::AdmissionFull,
+            PrivateRestAdmissionError::Closed => Self::AdmissionClosed,
+        }
+    }
+}
+
+impl IntoResponse for FederationLocalStatusError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Mint(error) => cdk_error_response(error),
+            Self::Internal(error) => anyhow_response(error),
+            error => (error.http_status(), error.public_message()).into_response(),
+        }
+    }
+}
+
+/// How much work to spend on payment observation reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaymentReportDetail {
+    /// Read every quote's observations and age, as the private REST route does.
+    Full,
+    /// Read observations once and look up ages only for unresolved reports.
+    UnresolvedQuoteAges,
+}
+
+/// What a local status build includes.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LocalStatusOptions {
+    /// Compute the full materialized-state snapshot and its row fingerprints.
+    pub(super) include_materialized_rows: bool,
+    /// Payment observation report detail.
+    pub(super) payment_reports: PaymentReportDetail,
+}
+
+/// Custody parts of a member's local status.
+#[derive(Debug, Clone)]
+pub struct FederationCustodyStatus {
+    /// Active local federated on-chain wallet sources.
+    pub onchain_wallets: Vec<FederationOnchainWalletStatus>,
+    /// Recovery classification for the joint wallet.
+    pub wallet_recovery: Option<FederationWalletRecoveryStatus>,
+    /// Proposer and signing-coordinator liveness.
+    pub wallet_liveness: Option<FederationWalletLivenessStatus>,
+    /// Wallet state accepted by consensus.
+    pub wallet_operator: Option<FederationWalletOperatorStatus>,
+    /// Operator views of feature-gated applications, such as `bark`.
+    pub application_operators: BTreeMap<String, serde_json::Value>,
+}
+
+/// Build a member's local status the way the private REST route does.
+///
+/// Admission and request verification are the caller's job. Records the
+/// status metrics when built with Prometheus.
+pub(super) async fn build_local_status(
+    state: &MintState,
+    options: LocalStatusOptions,
+) -> Result<FederationLocalStatusResponse, FederationLocalStatusError> {
+    let (peer_status, materialized_state_rows) = if options.include_materialized_rows {
+        local_peer_status_with_materialized_rows(state).await?
     } else {
-        (
-            local_peer_status(&state).await.map_err(anyhow_response)?,
-            Vec::new(),
-        )
+        (local_peer_status(state).await?, Vec::new())
     };
     let sync_status = state.federation_sync_status().await.unwrap_or_default();
-    let checkpoint = federation_checkpoint_status(&state)
-        .await
-        .map_err(cdk_error_response)?;
-    let payment_observation_reports = payment_observation_report_summaries(&state)
-        .await
-        .map_err(cdk_error_response)?;
+    let checkpoint = federation_checkpoint_status(state).await?;
+    let payment_observation_reports = match options.payment_reports {
+        PaymentReportDetail::Full => payment_observation_report_summaries(state).await?,
+        PaymentReportDetail::UnresolvedQuoteAges => {
+            payment_observation_report_summaries_with_unresolved_ages(state).await?
+        }
+    };
     let pending_mempool_items = state.federation_pending_mempool_len().await;
     let notification_stats = state.federation_operation_notification_stats();
     let aleph_bft_status = state.federation_aleph_bft_status().await;
@@ -76,54 +192,7 @@ pub(super) async fn post_local_status(
     let aleph_bft_network_inbound_active =
         state.federation_aleph_bft_network_inbound_active().await;
     let invalid_operation_alerts = state.federation_invalid_operation_alert_summaries().await;
-    #[cfg(feature = "federation-bdk")]
-    let onchain_wallets = state.federation_onchain_wallet_statuses().await;
-    #[cfg(not(feature = "federation-bdk"))]
-    let onchain_wallets = Vec::new();
-    #[cfg(feature = "federation-bdk")]
-    let wallet_recovery = federation_wallet_recovery_status(&state)
-        .await
-        .map_err(cdk_error_response)?;
-    #[cfg(not(feature = "federation-bdk"))]
-    let wallet_recovery = None;
-    #[cfg(feature = "federation-bdk")]
-    let wallet_liveness = state
-        .mint
-        .federation_config()
-        .and_then(|runtime| runtime.public_config().frost_wallet.as_ref())
-        .is_some()
-        .then(|| state.federation.wallet_liveness.clone());
-    #[cfg(feature = "federation-bdk")]
-    let wallet_liveness = match wallet_liveness {
-        Some(worker) => Some(worker.status().await),
-        None => None,
-    };
-    #[cfg(not(feature = "federation-bdk"))]
-    let wallet_liveness = None;
-    #[cfg(feature = "federation-bdk")]
-    let wallet_operator = federation_wallet_operator_status(&state, wallet_liveness.as_ref())
-        .await
-        .map_err(cdk_error_response)?;
-    #[cfg(not(feature = "federation-bdk"))]
-    let wallet_operator = None;
-    #[cfg(feature = "federation-bark")]
-    let application_operators = {
-        let mut application_operators = std::collections::BTreeMap::new();
-        if let Some(bark) = federation_bark_operator_status(&state)
-            .await
-            .map_err(anyhow_response)?
-        {
-            #[cfg(feature = "prometheus")]
-            record_bark_operator_metrics(&peer_status.member_id.to_string(), &bark);
-            application_operators.insert(
-                "bark".to_owned(),
-                serde_json::to_value(bark).map_err(|error| anyhow_response(error.into()))?,
-            );
-        }
-        application_operators
-    };
-    #[cfg(not(feature = "federation-bark"))]
-    let application_operators = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    let custody = build_custody_status(state, peer_status.member_id).await?;
     let response = FederationLocalStatusResponse {
         version: FEDERATION_REST_API_VERSION,
         peer_status,
@@ -156,15 +225,77 @@ pub(super) async fn post_local_status(
         aleph_bft_network_inbound_active,
         materialized_state_rows,
         invalid_operation_alerts,
+        onchain_wallets: custody.onchain_wallets,
+        wallet_recovery: custody.wallet_recovery,
+        wallet_liveness: custody.wallet_liveness,
+        wallet_operator: custody.wallet_operator,
+        application_operators: custody.application_operators,
+    };
+    #[cfg(feature = "prometheus")]
+    record_federation_local_status_metrics(&response);
+    Ok(response)
+}
+
+/// Build the custody parts of a member's local status.
+///
+/// Records the Bark metrics when built with Prometheus and Bark.
+pub(super) async fn build_custody_status(
+    state: &MintState,
+    member_id: MemberId,
+) -> Result<FederationCustodyStatus, FederationLocalStatusError> {
+    #[cfg(not(all(feature = "prometheus", feature = "federation-bark")))]
+    let _ = member_id;
+    #[cfg(not(any(feature = "federation-bdk", feature = "federation-bark")))]
+    let _ = state;
+    #[cfg(feature = "federation-bdk")]
+    let onchain_wallets = state.federation_onchain_wallet_statuses().await;
+    #[cfg(not(feature = "federation-bdk"))]
+    let onchain_wallets = Vec::new();
+    #[cfg(feature = "federation-bdk")]
+    let wallet_recovery = federation_wallet_recovery_status(state).await?;
+    #[cfg(not(feature = "federation-bdk"))]
+    let wallet_recovery = None;
+    #[cfg(feature = "federation-bdk")]
+    let wallet_liveness = state
+        .mint
+        .federation_config()
+        .and_then(|runtime| runtime.public_config().frost_wallet.as_ref())
+        .is_some()
+        .then(|| state.federation.wallet_liveness.clone());
+    #[cfg(feature = "federation-bdk")]
+    let wallet_liveness = match wallet_liveness {
+        Some(worker) => Some(worker.status().await),
+        None => None,
+    };
+    #[cfg(not(feature = "federation-bdk"))]
+    let wallet_liveness = None;
+    #[cfg(feature = "federation-bdk")]
+    let wallet_operator =
+        federation_wallet_operator_status(state, wallet_liveness.as_ref()).await?;
+    #[cfg(not(feature = "federation-bdk"))]
+    let wallet_operator = None;
+    #[cfg(feature = "federation-bark")]
+    let application_operators = {
+        let mut application_operators = BTreeMap::new();
+        if let Some(bark) = federation_bark_operator_status(state).await? {
+            #[cfg(feature = "prometheus")]
+            record_bark_operator_metrics(&member_id.to_string(), &bark);
+            application_operators.insert(
+                "bark".to_owned(),
+                serde_json::to_value(bark).map_err(anyhow::Error::from)?,
+            );
+        }
+        application_operators
+    };
+    #[cfg(not(feature = "federation-bark"))]
+    let application_operators = BTreeMap::<String, serde_json::Value>::new();
+    Ok(FederationCustodyStatus {
         onchain_wallets,
         wallet_recovery,
         wallet_liveness,
         wallet_operator,
         application_operators,
-    };
-    #[cfg(feature = "prometheus")]
-    record_federation_local_status_metrics(&response);
-    Ok(Json(response))
+    })
 }
 
 #[cfg(feature = "federation-bark")]

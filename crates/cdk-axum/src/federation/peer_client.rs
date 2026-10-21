@@ -19,11 +19,12 @@ use cdk::federation::{
     FederationFrostDkgRound1Request, FederationFrostDkgRound2Request,
     FederationFrostSignatureShareResponse, FederationFrostSigningAbortRequest,
     FederationFrostSigningAck, FederationFrostSigningPackageRequest, FederationId,
-    FederationJournalCatchUpRequest, FederationJournalCatchUpResponse, FederationPeerStatus,
-    FederationPeerStatusRequest, FederationRestMessageKind, FederationSignedRequest,
-    FederationSubmitOperationRequest, FederationSubmitOperationResponse, MemberConfigPrivate,
-    MemberConfigPublic, FEDERATION_MAX_ALEPH_BFT_BACKUP_PAGE_BYTES,
-    FEDERATION_MAX_ALEPH_BFT_BACKUP_REQUEST_BYTES, FEDERATION_MAX_CHECKPOINT_CATCH_UP_PAGE_BYTES,
+    FederationJournalCatchUpRequest, FederationJournalCatchUpResponse,
+    FederationLocalStatusResponse, FederationPeerStatus, FederationPeerStatusRequest,
+    FederationRestMessageKind, FederationSignedRequest, FederationSubmitOperationRequest,
+    FederationSubmitOperationResponse, MemberConfigPrivate, MemberConfigPublic,
+    FEDERATION_MAX_ALEPH_BFT_BACKUP_PAGE_BYTES, FEDERATION_MAX_ALEPH_BFT_BACKUP_REQUEST_BYTES,
+    FEDERATION_MAX_CHECKPOINT_CATCH_UP_PAGE_BYTES,
     FEDERATION_MAX_CHECKPOINT_CATCH_UP_REQUEST_BYTES, FEDERATION_REST_API_VERSION,
 };
 #[cfg(feature = "federation-bark")]
@@ -250,6 +251,29 @@ where
             )
             .await?;
         validate_peer_status(&self.public_config, member, &status)?;
+        Ok(status)
+    }
+
+    /// Fetch a member's detailed local status from its `local-status` route.
+    pub(crate) async fn local_status(
+        &self,
+        member: &MemberConfigPublic,
+    ) -> anyhow::Result<FederationLocalStatusResponse> {
+        let request = self.signed_request(
+            member,
+            FederationRestMessageKind::Status,
+            FederationPeerStatusRequest::default(),
+        )?;
+        let status = self
+            .http_post_with_timeout(
+                member,
+                "local-status",
+                "local status request",
+                &request,
+                self.sync_config.peer_request_timeout,
+            )
+            .await?;
+        validate_local_status(&self.public_config, member, &status)?;
         Ok(status)
     }
 
@@ -1329,6 +1353,38 @@ fn federation_endpoint(member: &MemberConfigPublic, endpoint: &str) -> anyhow::R
     Ok(member
         .federation_api_url
         .join_paths(&["federation", "v1", endpoint])?)
+}
+
+fn validate_local_status(
+    public_config: &FederationConfig,
+    member: &MemberConfigPublic,
+    status: &FederationLocalStatusResponse,
+) -> anyhow::Result<()> {
+    for version in [status.version, status.peer_status.version] {
+        if version != FEDERATION_REST_API_VERSION {
+            return Err(FederationError::RestVersionMismatch {
+                expected: FEDERATION_REST_API_VERSION,
+                found: version,
+            }
+            .into());
+        }
+    }
+    if status.peer_status.federation_id != public_config.federation_id {
+        return Err(FederationError::RestFederationMismatch {
+            expected: public_config.federation_id,
+            found: status.peer_status.federation_id,
+        }
+        .into());
+    }
+    if status.peer_status.member_id != member.member_id {
+        return Err(FederationError::MemberIdMismatch {
+            expected: member.member_id,
+            found: status.peer_status.member_id,
+        }
+        .into());
+    }
+
+    Ok(())
 }
 
 fn validate_peer_status(

@@ -37,12 +37,13 @@ pub use self::federation::federation_transport_with_iroh_node;
 pub use self::federation::services::{FederationServices, RunningFederationServices};
 #[cfg(feature = "federation")]
 pub use self::federation::{
-    create_federation_setup_router, default_federation_transport, FederationDkgAutoStartConfig,
-    FederationDkgDriverRunConfig, FederationDkgDriverRunOutcome, FederationDkgDriverTickOutcome,
-    FederationDkgSecretShareTransportPolicy, FederationPeerSyncConfig,
+    create_federation_setup_router, default_federation_transport, FederationCustodyStatus,
+    FederationDkgAutoStartConfig, FederationDkgDriverRunConfig, FederationDkgDriverRunOutcome,
+    FederationDkgDriverTickOutcome, FederationDkgSecretShareTransportPolicy,
+    FederationLocalStatusError, FederationMemberLocalStatus, FederationPeerSyncConfig,
     FederationPeerSyncConfigError, FederationSetupCoordinatorService,
     FederationSetupCoordinatorServiceConfig, FederationSetupHttpClient, FederationSetupHttpError,
-    FederationSetupHttpErrorCode, FederationTransport,
+    FederationSetupHttpErrorCode, FederationStatusHandle, FederationTransport,
 };
 mod router_handlers;
 mod ws;

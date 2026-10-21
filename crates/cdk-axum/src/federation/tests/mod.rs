@@ -4720,6 +4720,7 @@ mod operations;
 mod peer_client;
 mod recovery;
 mod status;
+mod status_handle;
 
 async fn queue_local_aleph_bft_unit(
     state: &MintState,

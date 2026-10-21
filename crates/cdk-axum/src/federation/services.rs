@@ -112,6 +112,14 @@ impl FederationServices {
         }
     }
 
+    /// Read-only status access for management interfaces.
+    ///
+    /// Take it before [`Self::start`]; it keeps working while the services
+    /// run and needs no started workers.
+    pub fn status_handle(&self) -> super::FederationStatusHandle {
+        super::FederationStatusHandle::new(self.state.clone())
+    }
+
     /// Start maintenance and retain ownership of every worker and quote task.
     pub async fn start(self) -> Result<RunningFederationServices, cdk::Error> {
         let tasks = self.state.federation.tasks.clone();

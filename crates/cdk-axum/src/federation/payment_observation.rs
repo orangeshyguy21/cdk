@@ -1432,6 +1432,53 @@ pub(super) async fn payment_observation_report_summaries(
     Ok(reports)
 }
 
+/// Build the same reports as [`payment_observation_report_summaries`] with
+/// fewer database reads, for management status requests.
+///
+/// Observations are read once and grouped in memory instead of once per quote,
+/// and the quote's age is looked up only for unresolved reports. Only those can
+/// turn stale, so status and recommended action match the full build; resolved
+/// reports omit their quote age.
+pub(super) async fn payment_observation_report_summaries_with_unresolved_ages(
+    state: &MintState,
+) -> Result<Vec<FederationPaymentObservationReportSummary>, cdk::Error> {
+    let Some(runtime_config) = state.mint.federation_config() else {
+        return Ok(Vec::new());
+    };
+    let db = state.mint.localstore();
+    let mut records_by_report = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for record in db.get_all_federation_payment_observations().await? {
+        records_by_report
+            .entry((
+                record.observation.context(),
+                record.observation.quote().to_string(),
+            ))
+            .or_default()
+            .push(record);
+    }
+
+    let mut reports = Vec::with_capacity(records_by_report.len());
+    let now = current_unix_time();
+    for ((context, quote), records) in records_by_report {
+        let required = runtime_config
+            .public_config()
+            .payment_verification_policy(context)
+            .required_matching_observations();
+        let report =
+            FederationPaymentObservationReport::from_records(context, &quote, required, &records);
+        let quote_age_secs = match report.is_unresolved() {
+            true => payment_observation_quote_age_secs(state, context, &quote, now).await?,
+            false => None,
+        };
+        reports.push(
+            report
+                .summary_with_quote_age(quote_age_secs, FEDERATION_STALE_PAYMENT_OBSERVATION_SECS),
+        );
+    }
+
+    Ok(reports)
+}
+
 async fn payment_observation_quote_age_secs(
     state: &MintState,
     context: cdk::federation::FederationPaymentObservationContext,
