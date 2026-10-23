@@ -222,7 +222,7 @@ fn member_status_maps_the_local_status_summary() {
     assert_eq!(mapped.member_id, 2);
     assert_eq!(mapped.federation_id, config.federation_id.to_string());
     let sync = mapped.sync.expect("sync");
-    assert_eq!(sync.state, "lagging");
+    assert_eq!(sync.state(), proto::SyncState::Lagging);
     assert!(!sync.ready);
     assert!(!sync.message.contains("hunter2"));
     assert_eq!(sync.peer_member_id, Some(3));
@@ -537,6 +537,10 @@ fn custody_status_maps_wallet_blocks() {
 
     assert_eq!(mapped.onchain_wallets.len(), 1);
     assert_eq!(mapped.onchain_wallets[0].source, "esplora");
+    assert_eq!(
+        mapped.onchain_wallets[0].health(),
+        proto::OnchainSourceHealth::Healthy
+    );
     assert_eq!(mapped.onchain_wallets[0].local_tip_height, 120);
     let recovery = mapped.wallet_recovery.expect("recovery");
     assert_eq!(recovery.address_allocations, 2);

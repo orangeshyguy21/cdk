@@ -28,6 +28,13 @@ where
         .unwrap_or_else(|| "none".to_string())
 }
 
+/// Lowercases a proto enum name without its type prefix.
+pub(super) fn short_name(name: &str, prefix: &str) -> String {
+    name.strip_prefix(prefix)
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+}
+
 /// Comma-separated values, or `none`.
 pub(super) fn list<T>(values: &[T]) -> String
 where

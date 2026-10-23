@@ -268,6 +268,19 @@ fn verification_policy(
     }
 }
 
+/// Map a sync state name. Peers report it over HTTP, so an unknown name from a
+/// newer member stays unspecified.
+fn sync_state(state: &str) -> proto::SyncState {
+    match state {
+        "healthy" => proto::SyncState::Healthy,
+        "awaiting_quorum" => proto::SyncState::AwaitingQuorum,
+        "lagging" => proto::SyncState::Lagging,
+        "catching_up" => proto::SyncState::CatchingUp,
+        "halted" => proto::SyncState::Halted,
+        _ => proto::SyncState::Unspecified,
+    }
+}
+
 pub(crate) fn member_status(
     status: &FederationLocalStatusResponse,
     payment_report_limit: usize,
@@ -279,7 +292,7 @@ pub(crate) fn member_status(
         member_id: u32::from(peer.member_id.get()),
         federation_id: peer.federation_id.to_string(),
         sync: Some(proto::SyncStatus {
-            state: status.sync_state.clone(),
+            state: sync_state(&status.sync_state).into(),
             ready: status.sync_ready,
             message: redact_federation_operator_message(&status.sync_message),
             peer_member_id: status.sync_peer.map(|member| u32::from(member.get())),
@@ -615,13 +628,22 @@ pub(crate) fn custody_status(
     })
 }
 
+fn onchain_source_health(health: &str) -> proto::OnchainSourceHealth {
+    match health {
+        "never_synced" => proto::OnchainSourceHealth::NeverSynced,
+        "healthy" => proto::OnchainSourceHealth::Healthy,
+        "degraded" => proto::OnchainSourceHealth::Degraded,
+        _ => proto::OnchainSourceHealth::Unspecified,
+    }
+}
+
 fn onchain_wallet_source(source: &FederationOnchainWalletStatus) -> proto::OnchainWalletSource {
     proto::OnchainWalletSource {
         source: source.source.clone(),
         source_scope: source.source_scope.clone(),
         source_id: source.source_id.clone(),
         correlated_source_warning: source.correlated_source_warning,
-        health: source.health.clone(),
+        health: onchain_source_health(&source.health).into(),
         local_tip_height: source.local_tip_height,
         local_tip_hash: source.local_tip_hash.clone(),
         last_success_unix: source.last_success_unix,
@@ -806,7 +828,7 @@ fn bark_operator(
     let details_json = serde_json::to_string(value)
         .map_err(|error| ProviderError::internal(format!("invalid Bark status: {error}")))?;
     Ok(Some(proto::BarkOperatorStatus {
-        readiness: bark.readiness,
+        readiness: bark_readiness(&bark.readiness).into(),
         degraded_reason: bark.degraded_reason,
         accepted_frontier: bark.accepted_frontier,
         local_frontier: bark.local_frontier,
@@ -832,6 +854,16 @@ fn bark_operator(
         missing_acknowledged_receive_secrets: bark.receive_secrets.missing_acknowledged_nonterminal,
         details_json,
     }))
+}
+
+#[cfg(feature = "federation-bark")]
+fn bark_readiness(readiness: &str) -> proto::BarkReadiness {
+    match readiness {
+        "ready" => proto::BarkReadiness::Ready,
+        "behind_consensus" => proto::BarkReadiness::BehindConsensus,
+        "degraded" => proto::BarkReadiness::Degraded,
+        _ => proto::BarkReadiness::Unspecified,
+    }
 }
 
 /// Without Bark support the daemon never runs Bark custody.

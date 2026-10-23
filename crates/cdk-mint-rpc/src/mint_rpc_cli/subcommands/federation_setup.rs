@@ -7,12 +7,12 @@ use clap::{Args, Subcommand};
 use tonic::transport::Channel;
 use tonic::Request;
 
-use super::output::{list, number, text, OutputCommand};
+use super::output::{list, number, short_name, text, OutputCommand};
 use crate::federation_setup::federation_setup_service_client::FederationSetupServiceClient;
 use crate::federation_setup::{
     AbortSetupRequest, ActivateSetupRequest, ApproveProposalRequest, CreateSetupRequest,
     GetSetupStatusRequest, GetSetupStatusResponse, JoinSetupRequest, ProposeSetupRequest,
-    ReplaceInvitationRequest, ReviewProposalRequest, SetupKeyset,
+    ReplaceInvitationRequest, ReviewProposalRequest, SetupDkgProgress, SetupKeyset,
 };
 
 /// Largest invitation file the CLI will read.
@@ -392,16 +392,10 @@ fn print_status(status: &GetSetupStatusResponse) {
         "identity_fingerprint: {}",
         text(status.identity_fingerprint.as_deref())
     );
-    println!("role: {}", escape_control(&status.role));
-    println!(
-        "participant_phase: {}",
-        escape_control(&status.participant_phase)
-    );
-    if status.coordinator_phase.is_some() {
-        println!(
-            "coordinator_phase: {}",
-            text(status.coordinator_phase.as_deref())
-        );
+    println!("role: {}", role_name(status));
+    println!("participant_phase: {}", participant_phase_name(status));
+    if let Some(phase) = coordinator_phase_name(status) {
+        println!("coordinator_phase: {phase}");
     }
     println!(
         "enrollments: {}/{} missing={}",
@@ -420,7 +414,7 @@ fn print_status(status: &GetSetupStatusResponse) {
     if let Some(dkg) = status.dkg.as_ref() {
         println!(
             "dkg_phase: {} commitments={} reveals={} shares={} transcript_signatures={} final_confirmations={}/{} finalized_ready={}",
-            escape_control(&dkg.phase),
+            dkg_phase_name(dkg),
             dkg.commitments,
             dkg.reveals,
             dkg.secret_share_contributions,
@@ -445,9 +439,9 @@ fn status_json(status: &GetSetupStatusResponse) -> serde_json::Value {
         "setup_id": status.setup_id,
         "member_id": status.member_id,
         "identity_fingerprint": status.identity_fingerprint,
-        "role": status.role,
-        "participant_phase": status.participant_phase,
-        "coordinator_phase": status.coordinator_phase,
+        "role": role_name(status),
+        "participant_phase": participant_phase_name(status),
+        "coordinator_phase": coordinator_phase_name(status),
         "member_count": status.member_count,
         "enrolled_members": status.enrolled_members,
         "missing_enrollments": status.missing_enrollments,
@@ -456,7 +450,7 @@ fn status_json(status: &GetSetupStatusResponse) -> serde_json::Value {
         "proposal_hash": status.proposal_hash,
         "manifest_hash": status.manifest_hash,
         "dkg": status.dkg.as_ref().map(|dkg| serde_json::json!({
-            "phase": dkg.phase,
+            "phase": dkg_phase_name(dkg),
             "commitments": dkg.commitments,
             "reveals": dkg.reveals,
             "secret_share_contributions": dkg.secret_share_contributions,
@@ -480,6 +474,30 @@ fn status_json(status: &GetSetupStatusResponse) -> serde_json::Value {
             "activated_at_unix": activation.activated_at_unix,
         })),
     })
+}
+
+fn role_name(status: &GetSetupStatusResponse) -> String {
+    short_name(status.role().as_str_name(), "SETUP_ROLE_")
+}
+
+fn participant_phase_name(status: &GetSetupStatusResponse) -> String {
+    short_name(
+        status.participant_phase().as_str_name(),
+        "SETUP_PARTICIPANT_PHASE_",
+    )
+}
+
+fn coordinator_phase_name(status: &GetSetupStatusResponse) -> Option<String> {
+    status.coordinator_phase.is_some().then(|| {
+        short_name(
+            status.coordinator_phase().as_str_name(),
+            "SETUP_COORDINATOR_PHASE_",
+        )
+    })
+}
+
+fn dkg_phase_name(dkg: &SetupDkgProgress) -> String {
+    short_name(dkg.phase().as_str_name(), "SETUP_DKG_PHASE_")
 }
 
 fn read_invitation_file(path: &Path) -> Result<String> {

@@ -194,10 +194,86 @@ message ApproveProposalResponse {
 message GetSetupStatusRequest {
 }
 
+// Role of this daemon in the setup.
+enum SetupRole {
+    SETUP_ROLE_UNSPECIFIED = 0;
+    // Created the setup and coordinates enrollment and approval.
+    SETUP_ROLE_COORDINATOR = 1;
+    // Joined the setup with an invitation.
+    SETUP_ROLE_MEMBER = 2;
+}
+
+// Phase of this daemon as a setup participant.
+enum SetupParticipantPhase {
+    SETUP_PARTICIPANT_PHASE_UNSPECIFIED = 0;
+    // Identity created; the coordinator has not accepted the enrollment yet.
+    SETUP_PARTICIPANT_PHASE_IDENTITY_CREATED = 1;
+    // The coordinator accepted the enrollment.
+    SETUP_PARTICIPANT_PHASE_ENROLLED = 2;
+    // The proposal was reviewed.
+    SETUP_PARTICIPANT_PHASE_PROPOSAL_REVIEWED = 3;
+    // The proposal was approved.
+    SETUP_PARTICIPANT_PHASE_APPROVED = 4;
+    // The certified manifest was received.
+    SETUP_PARTICIPANT_PHASE_CERTIFIED = 5;
+    // Key generation is running.
+    SETUP_PARTICIPANT_PHASE_DKG_RUNNING = 6;
+    // Key generation finished; ActivateSetup can run.
+    SETUP_PARTICIPANT_PHASE_READY_TO_ACTIVATE = 7;
+    // The setup was activated.
+    SETUP_PARTICIPANT_PHASE_ACTIVATED = 8;
+    // The setup was aborted.
+    SETUP_PARTICIPANT_PHASE_ABORTED = 9;
+}
+
+// Phase of the setup coordinator.
+enum SetupCoordinatorPhase {
+    SETUP_COORDINATOR_PHASE_UNSPECIFIED = 0;
+    // Collecting member enrollments.
+    SETUP_COORDINATOR_PHASE_COLLECTING_ENROLLMENTS = 1;
+    // The proposal is published for approval.
+    SETUP_COORDINATOR_PHASE_PROPOSAL_PUBLISHED = 2;
+    // Every member approved and the manifest is certified.
+    SETUP_COORDINATOR_PHASE_CERTIFIED = 3;
+    // Coordination is finished.
+    SETUP_COORDINATOR_PHASE_CLOSED = 4;
+    // The setup was aborted.
+    SETUP_COORDINATOR_PHASE_ABORTED = 5;
+}
+
+// Key generation phase.
+enum SetupDkgPhase {
+    SETUP_DKG_PHASE_UNSPECIFIED = 0;
+    // Key generation has not started.
+    SETUP_DKG_PHASE_NOT_STARTED = 1;
+    // Exchanging commitments.
+    SETUP_DKG_PHASE_COMMITMENT = 2;
+    // Revealing public polynomials.
+    SETUP_DKG_PHASE_REVEAL = 3;
+    // Delivering secret shares.
+    SETUP_DKG_PHASE_SHARE_DELIVERY = 4;
+    // Storing this member's keyset share.
+    SETUP_DKG_PHASE_LOCAL_KEYSET_SHARE = 5;
+    // Signing the key generation transcript.
+    SETUP_DKG_PHASE_TRANSCRIPT_SIGNATURE = 6;
+    // Confirming the final config with every member.
+    SETUP_DKG_PHASE_ACTIVATION = 7;
+    // FROST key generation, round one.
+    SETUP_DKG_PHASE_FROST_ROUND_1 = 8;
+    // FROST key generation, round two.
+    SETUP_DKG_PHASE_FROST_ROUND_2 = 9;
+    // Confirming the FROST result.
+    SETUP_DKG_PHASE_FROST_CONFIRMATION = 10;
+    // Key generation finished.
+    SETUP_DKG_PHASE_COMPLETE = 11;
+    // The stored key generation records are inconsistent; see error.
+    SETUP_DKG_PHASE_INVALID = 12;
+}
+
 // Progress of the distributed key generation that follows approval.
 message SetupDkgProgress {
     // Key generation phase.
-    string phase = 1;
+    SetupDkgPhase phase = 1;
     // Number of member participant states recorded.
     uint64 participant_states = 2;
     // Number of commitments recorded.
@@ -252,12 +328,12 @@ message GetSetupStatusResponse {
     optional string setup_id = 2;
     // Member slot of this daemon.
     optional uint32 member_id = 3;
-    // "coordinator" or "member". Empty when not initialized.
-    string role = 4;
+    // Role of this daemon. Unspecified when not initialized.
+    SetupRole role = 4;
     // Phase of this daemon as a setup participant.
-    string participant_phase = 5;
+    SetupParticipantPhase participant_phase = 5;
     // Phase of the coordinator, when this daemon is the coordinator.
-    optional string coordinator_phase = 6;
+    optional SetupCoordinatorPhase coordinator_phase = 6;
     // Number of federation members.
     uint32 member_count = 7;
     // Members that have enrolled, ordered by member_id.

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use tonic::transport::Channel;
 use tonic::Request;
 
-use super::output::{list, number, text, OutputCommand};
+use super::output::{list, number, short_name, text, OutputCommand};
 use crate::federation::federation_service_client::FederationServiceClient;
 use crate::federation::{
     BarkOperatorStatus, CheckpointStatus, DigestAgreement, GetCustodyStatusRequest,
@@ -146,13 +146,6 @@ async fn custody(
     Ok(())
 }
 
-/// Lowercases a proto enum name without its type prefix.
-fn short_name(name: &str, prefix: &str) -> String {
-    name.strip_prefix(prefix)
-        .unwrap_or(name)
-        .to_ascii_lowercase()
-}
-
 fn policy_text(policy: Option<&PaymentVerificationPolicy>) -> String {
     match policy {
         Some(policy) => format!(
@@ -254,7 +247,7 @@ fn member_status_line(status: &MemberStatus) -> String {
     let checkpoint = status.checkpoint.clone().unwrap_or_default();
     format!(
         "sync={} ready={} operations={} latest_index={} session={} order_digest={} application_digest={} live_session={} network_inbound={} audit_mismatch={} trusted_checkpoint={} checkpoint_lag_operations={}",
-        escape_control(&sync.state),
+        short_name(sync.state().as_str_name(), "SYNC_STATE_"),
         sync.ready,
         peer.operation_count,
         number(peer.latest_index),
@@ -387,7 +380,7 @@ fn member_status_json(status: &MemberStatus) -> Value {
         "member_id": status.member_id,
         "federation_id": status.federation_id,
         "sync": {
-            "state": sync.state,
+            "state": short_name(sync.state().as_str_name(), "SYNC_STATE_"),
             "ready": sync.ready,
             "message": sync.message,
             "peer_member_id": sync.peer_member_id,
@@ -626,7 +619,7 @@ fn onchain_source_line(source: &OnchainWalletSource) -> String {
         escape_control(&source.source_scope),
         escape_control(&source.source_id),
         source.correlated_source_warning,
-        escape_control(&source.health),
+        short_name(source.health().as_str_name(), "ONCHAIN_SOURCE_HEALTH_"),
         source.local_tip_height,
         escape_control(&source.local_tip_hash),
         number(source.last_success_unix),
@@ -732,7 +725,7 @@ fn bark_line(bark: &BarkOperatorStatus) -> String {
         .collect::<Vec<_>>();
     format!(
         "bark readiness={} degraded_reason={} accepted_frontier={} local_frontier={} lag_operations={} network={} chain_tip={} vtxos={} expiring_vtxos={} expiring_value_sat={} ambiguous_actions={} ambiguous_value_sat={} recovery_actions={} recovery_value_sat={} signer_retry_actions={} missing_acknowledged_receive_secrets={}",
-        escape_control(&bark.readiness),
+        short_name(bark.readiness().as_str_name(), "BARK_READINESS_"),
         text(bark.degraded_reason.as_deref()),
         bark.accepted_frontier,
         bark.local_frontier,
@@ -758,7 +751,7 @@ fn custody_json(response: &GetCustodyStatusResponse) -> Value {
             "source_scope": source.source_scope,
             "source_id": source.source_id,
             "correlated_source_warning": source.correlated_source_warning,
-            "health": source.health,
+            "health": short_name(source.health().as_str_name(), "ONCHAIN_SOURCE_HEALTH_"),
             "local_tip_height": source.local_tip_height,
             "local_tip_hash": source.local_tip_hash,
             "last_success_unix": source.last_success_unix,
@@ -817,7 +810,7 @@ fn custody_json(response: &GetCustodyStatusResponse) -> Value {
             // Re-encoding escapes any control characters inside the server's strings.
             let details = serde_json::from_str::<Value>(&bark.details_json).unwrap_or(Value::Null);
             json!({
-                "readiness": bark.readiness,
+                "readiness": short_name(bark.readiness().as_str_name(), "BARK_READINESS_"),
                 "degraded_reason": bark.degraded_reason,
                 "accepted_frontier": bark.accepted_frontier,
                 "local_frontier": bark.local_frontier,

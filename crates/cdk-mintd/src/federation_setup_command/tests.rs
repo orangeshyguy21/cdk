@@ -11,10 +11,11 @@ use cdk_common::database::MintFederationSetupDatabase;
 use cdk_common::federation::FederationSetupFrostApplication;
 use cdk_common::federation::{
     FederationCheckpointPolicy, FederationDkgKeysetSpec, FederationPaymentObservationPolicy,
-    FederationSetupApproval, FederationSetupBitcoinNetwork, FederationSetupEnrollment,
-    FederationSetupFrostPolicy, FederationSetupInvitation, FederationSetupInvitationState,
-    FederationSetupParticipantPhase, FederationSetupProposal, FederationSetupUrlPolicy, MemberId,
-    ThresholdParams, FEDERATION_SETUP_MIN_INVITATION_LIFETIME_SECS,
+    FederationSetupApproval, FederationSetupBitcoinNetwork, FederationSetupCoordinatorPhase,
+    FederationSetupEnrollment, FederationSetupFrostPolicy, FederationSetupInvitation,
+    FederationSetupInvitationState, FederationSetupParticipantPhase, FederationSetupProposal,
+    FederationSetupUrlPolicy, MemberId, ThresholdParams,
+    FEDERATION_SETUP_MIN_INVITATION_LIFETIME_SECS,
 };
 use cdk_common::mint_url::MintUrl;
 #[cfg(feature = "federation-bark")]
@@ -734,7 +735,7 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
             .await
             .expect("creator status before its approval")
             .coordinator_phase,
-        Some("proposal_published".to_string())
+        Some(FederationSetupCoordinatorPhase::ProposalPublished)
     );
     // The creator approves last; its local approval must certify the manifest.
     approve_setup(
@@ -769,7 +770,7 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
             .await
             .expect("creator status")
             .coordinator_phase,
-        Some("certified".to_string())
+        Some(FederationSetupCoordinatorPhase::Certified)
     );
     for (database, config_path) in [
         (&member_two_db, &member_two_config),
@@ -974,7 +975,10 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
         let status = setup_status(config_path)
             .await
             .expect("setup status while holding");
-        assert_eq!(status.participant_phase, "dkg_running");
+        assert_eq!(
+            status.participant_phase,
+            FederationSetupParticipantPhase::DkgRunning
+        );
         let dkg = status.dkg.expect("DKG progress while holding");
         assert_eq!(dkg.final_config_confirmations, 3);
         assert!(
@@ -1070,7 +1074,10 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
     );
     for status in [creator_status, member_two_status, member_three_status] {
         let status = status.expect("post-DKG setup status");
-        assert_eq!(status.participant_phase, "ready_to_activate");
+        assert_eq!(
+            status.participant_phase,
+            FederationSetupParticipantPhase::ReadyToActivate
+        );
         assert!(status.dkg.expect("DKG progress").finalized_ready);
         assert!(status.activation.is_none());
     }
@@ -1163,7 +1170,10 @@ async fn ordinary_http_client_drives_three_independent_operator_stores_to_certif
         let status = setup_status(config_path)
             .await
             .expect("restarted activated setup status");
-        assert_eq!(status.participant_phase, "activated");
+        assert_eq!(
+            status.participant_phase,
+            FederationSetupParticipantPhase::Activated
+        );
         assert!(status.activation.is_some());
         assert_eq!(
             database
@@ -1280,8 +1290,6 @@ async fn replacing_an_invitation_keeps_the_member_invitation_file_current() {
 #[cfg(feature = "management-rpc")]
 #[tokio::test]
 async fn aborting_a_setup_before_certification_marks_both_phases_aborted() {
-    use cdk_common::federation::FederationSetupCoordinatorPhase;
-
     let root = TempDir::new().expect("test directory");
     let config = root.path().join("setup.json");
     let db_path = root.path().join("mint.sqlite");

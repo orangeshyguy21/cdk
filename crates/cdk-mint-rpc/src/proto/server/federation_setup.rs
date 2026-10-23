@@ -281,7 +281,7 @@ mod tests {
         ApproveProposalRequest, ApproveProposalResponse, CreateSetupRequest, CreateSetupResponse,
         GetSetupStatusRequest, GetSetupStatusResponse, JoinSetupRequest, JoinSetupResponse,
         ProposeSetupRequest, ProposeSetupResponse, ReplaceInvitationRequest,
-        ReplaceInvitationResponse, ReviewProposalRequest, ReviewProposalResponse,
+        ReplaceInvitationResponse, ReviewProposalRequest, ReviewProposalResponse, SetupRole,
     };
     use crate::{FederationSetupProvider, ProviderError};
 
@@ -384,7 +384,7 @@ mod tests {
             .into_inner();
         assert!(!status.initialized);
         assert!(status.setup_id.is_none());
-        assert!(status.role.is_empty());
+        assert_eq!(status.role(), SetupRole::Unspecified);
 
         let invalid = client
             .create_setup(CreateSetupRequest::default())

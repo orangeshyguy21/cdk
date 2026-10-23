@@ -21,9 +21,9 @@ use axum::Router;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::federation::{
     is_iroh_setup_url, FederationDkgCeremonyRecord, FederationSetupActivation,
-    FederationSetupBitcoinNetwork, FederationSetupId, FederationSetupInvitation,
-    FederationSetupLocalRole, FederationSetupParticipantPhase, FederationSetupProposalHash,
-    FederationSetupProposalReview, MemberId,
+    FederationSetupBitcoinNetwork, FederationSetupCoordinatorPhase, FederationSetupId,
+    FederationSetupInvitation, FederationSetupLocalRole, FederationSetupParticipantPhase,
+    FederationSetupProposalHash, FederationSetupProposalReview, MemberId,
 };
 use cdk_common::mint_url::MintUrl;
 use cdk_mint_rpc::federation_setup as proto;
@@ -897,8 +897,8 @@ fn status_response(
     status: FederationSetupCommandStatus,
 ) -> proto::GetSetupStatusResponse {
     let role = match config.local_role() {
-        FederationSetupLocalRole::Coordinator { .. } => "coordinator",
-        FederationSetupLocalRole::Member { .. } => "member",
+        FederationSetupLocalRole::Coordinator { .. } => proto::SetupRole::Coordinator,
+        FederationSetupLocalRole::Member { .. } => proto::SetupRole::Member,
     };
     let member_ids = |members: &[cdk_common::federation::MemberId]| {
         members
@@ -911,9 +911,11 @@ fn status_response(
         setup_id: Some(status.setup_id.to_string()),
         member_id: Some(u32::from(status.member_id.get())),
         identity_fingerprint: Some(status.identity_fingerprint),
-        role: role.to_string(),
-        participant_phase: status.participant_phase,
-        coordinator_phase: status.coordinator_phase,
+        role: role.into(),
+        participant_phase: participant_phase(status.participant_phase).into(),
+        coordinator_phase: status
+            .coordinator_phase
+            .map(|phase| coordinator_phase(phase).into()),
         member_count: u32::from(status.member_count),
         enrolled_members: member_ids(&status.enrolled_members),
         missing_enrollments: member_ids(&status.missing_enrollments),
@@ -926,13 +928,67 @@ fn status_response(
     }
 }
 
+fn participant_phase(phase: FederationSetupParticipantPhase) -> proto::SetupParticipantPhase {
+    match phase {
+        FederationSetupParticipantPhase::IdentityCreated => {
+            proto::SetupParticipantPhase::IdentityCreated
+        }
+        FederationSetupParticipantPhase::Enrolled => proto::SetupParticipantPhase::Enrolled,
+        FederationSetupParticipantPhase::ProposalReviewed => {
+            proto::SetupParticipantPhase::ProposalReviewed
+        }
+        FederationSetupParticipantPhase::Approved => proto::SetupParticipantPhase::Approved,
+        FederationSetupParticipantPhase::Certified => proto::SetupParticipantPhase::Certified,
+        FederationSetupParticipantPhase::DkgRunning => proto::SetupParticipantPhase::DkgRunning,
+        FederationSetupParticipantPhase::ReadyToActivate => {
+            proto::SetupParticipantPhase::ReadyToActivate
+        }
+        FederationSetupParticipantPhase::Activated => proto::SetupParticipantPhase::Activated,
+        FederationSetupParticipantPhase::Aborted => proto::SetupParticipantPhase::Aborted,
+    }
+}
+
+fn coordinator_phase(phase: FederationSetupCoordinatorPhase) -> proto::SetupCoordinatorPhase {
+    match phase {
+        FederationSetupCoordinatorPhase::CollectingEnrollments => {
+            proto::SetupCoordinatorPhase::CollectingEnrollments
+        }
+        FederationSetupCoordinatorPhase::ProposalPublished => {
+            proto::SetupCoordinatorPhase::ProposalPublished
+        }
+        FederationSetupCoordinatorPhase::Certified => proto::SetupCoordinatorPhase::Certified,
+        FederationSetupCoordinatorPhase::Closed => proto::SetupCoordinatorPhase::Closed,
+        FederationSetupCoordinatorPhase::Aborted => proto::SetupCoordinatorPhase::Aborted,
+    }
+}
+
+/// Map the DKG progress label, which also names the states before and outside
+/// the driver's own phases.
+fn dkg_phase(label: &str) -> proto::SetupDkgPhase {
+    match label {
+        "not_started" => proto::SetupDkgPhase::NotStarted,
+        "commitment" => proto::SetupDkgPhase::Commitment,
+        "reveal" => proto::SetupDkgPhase::Reveal,
+        "share_delivery" => proto::SetupDkgPhase::ShareDelivery,
+        "local_keyset_share" => proto::SetupDkgPhase::LocalKeysetShare,
+        "transcript_signature" => proto::SetupDkgPhase::TranscriptSignature,
+        "activation" => proto::SetupDkgPhase::Activation,
+        "frost_round_1" => proto::SetupDkgPhase::FrostRound1,
+        "frost_round_2" => proto::SetupDkgPhase::FrostRound2,
+        "frost_confirmation" => proto::SetupDkgPhase::FrostConfirmation,
+        "complete" => proto::SetupDkgPhase::Complete,
+        "invalid" => proto::SetupDkgPhase::Invalid,
+        _ => proto::SetupDkgPhase::Unspecified,
+    }
+}
+
 fn count(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn dkg_progress(progress: FederationSetupDkgProgress) -> proto::SetupDkgProgress {
     proto::SetupDkgProgress {
-        phase: progress.phase,
+        phase: dkg_phase(&progress.phase).into(),
         participant_states: count(progress.participant_states),
         commitments: count(progress.commitments),
         reveals: count(progress.reveals),
