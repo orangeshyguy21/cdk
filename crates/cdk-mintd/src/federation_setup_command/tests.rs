@@ -1277,6 +1277,61 @@ async fn replacing_an_invitation_keeps_the_member_invitation_file_current() {
     assert_eq!(available, vec![second.invitation_id]);
 }
 
+#[cfg(feature = "management-rpc")]
+#[tokio::test]
+async fn aborting_a_setup_before_certification_marks_both_phases_aborted() {
+    use cdk_common::federation::FederationSetupCoordinatorPhase;
+
+    let root = TempDir::new().expect("test directory");
+    let config = root.path().join("setup.json");
+    let db_path = root.path().join("mint.sqlite");
+    let db = MintSqliteDatabase::new(db_path.clone())
+        .await
+        .expect("creator database");
+    let created = create_setup(
+        &db,
+        &config,
+        root.path(),
+        &db_path,
+        &create_spec(),
+        NOW_UNIX,
+    )
+    .await
+    .expect("creator setup");
+
+    let other_setup = FederationSetupId::from_bytes([7; 32]);
+    abort_setup(&db, &config, other_setup, NOW_UNIX)
+        .await
+        .expect_err("another setup ID is refused");
+
+    let manifest = root.path().join(LOCAL_SETUP_MANIFEST_FILE);
+    std::fs::write(&manifest, "{}").expect("stand-in manifest");
+    abort_setup(&db, &config, created.setup_id, NOW_UNIX)
+        .await
+        .expect_err("a stored manifest means key generation may have started");
+    std::fs::remove_file(&manifest).expect("remove stand-in manifest");
+
+    abort_setup(&db, &config, created.setup_id, NOW_UNIX + 1)
+        .await
+        .expect("abort before certification");
+    abort_setup(&db, &config, created.setup_id, NOW_UNIX + 2)
+        .await
+        .expect("aborting again succeeds");
+    let session = db
+        .get_federation_setup_session(created.setup_id)
+        .await
+        .expect("setup session read")
+        .expect("setup session");
+    assert_eq!(
+        session.participant_phase,
+        FederationSetupParticipantPhase::Aborted
+    );
+    assert_eq!(
+        session.coordinator_phase,
+        Some(FederationSetupCoordinatorPhase::Aborted)
+    );
+}
+
 fn create_spec() -> FederationSetupCreateSpec {
     let thresholds = ThresholdParams::with_bft_consensus(3, 2).expect("safe thresholds");
     let applications = Vec::new();

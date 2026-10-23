@@ -5,11 +5,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::federation_setup::{
-    ActivateSetupRequest, ActivateSetupResponse, ApproveProposalRequest, ApproveProposalResponse,
-    CreateSetupRequest, CreateSetupResponse, GetSetupStatusRequest, GetSetupStatusResponse,
-    JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest, ProposeSetupResponse,
-    ReplaceInvitationRequest, ReplaceInvitationResponse, ReviewProposalRequest,
-    ReviewProposalResponse,
+    AbortSetupRequest, AbortSetupResponse, ActivateSetupRequest, ActivateSetupResponse,
+    ApproveProposalRequest, ApproveProposalResponse, CreateSetupRequest, CreateSetupResponse,
+    GetSetupStatusRequest, GetSetupStatusResponse, JoinSetupRequest, JoinSetupResponse,
+    ProposeSetupRequest, ProposeSetupResponse, ReplaceInvitationRequest, ReplaceInvitationResponse,
+    ReviewProposalRequest, ReviewProposalResponse,
 };
 use crate::ProviderError;
 
@@ -57,6 +57,12 @@ pub trait FederationSetupProvider {
         &self,
         request: GetSetupStatusRequest,
     ) -> Result<GetSetupStatusResponse, ProviderError>;
+
+    /// Abandons the current setup before key generation can have started.
+    async fn abort_setup(
+        &self,
+        request: AbortSetupRequest,
+    ) -> Result<AbortSetupResponse, ProviderError>;
 
     /// Activates the finished federation config.
     async fn activate_setup(

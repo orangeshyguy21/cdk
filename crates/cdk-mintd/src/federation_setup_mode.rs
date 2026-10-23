@@ -21,9 +21,9 @@ use axum::Router;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::federation::{
     is_iroh_setup_url, FederationDkgCeremonyRecord, FederationSetupActivation,
-    FederationSetupBitcoinNetwork, FederationSetupInvitation, FederationSetupLocalRole,
-    FederationSetupParticipantPhase, FederationSetupProposalHash, FederationSetupProposalReview,
-    MemberId,
+    FederationSetupBitcoinNetwork, FederationSetupId, FederationSetupInvitation,
+    FederationSetupLocalRole, FederationSetupParticipantPhase, FederationSetupProposalHash,
+    FederationSetupProposalReview, MemberId,
 };
 use cdk_common::mint_url::MintUrl;
 use cdk_mint_rpc::federation_setup as proto;
@@ -36,7 +36,7 @@ use tower::ServiceExt;
 use crate::config_service::ConfigurationService;
 use crate::federation_dkg_status::FederationSetupDkgProgress;
 use crate::federation_setup_command::{
-    activate_setup_with_db, approve_setup, build_certified_dkg_router,
+    abort_setup, activate_setup_with_db, approve_setup, build_certified_dkg_router,
     build_setup_coordinator_router, create_setup, current_unix_time, fetch_and_review_proposal,
     join_setup, parse_mint_url, propose_setup, read_local_config, refresh_certified_manifest,
     replace_invitation, review_local_proposal, serve_setup_router, setup_status_with_db,
@@ -48,6 +48,7 @@ use crate::{config, BdkWalletPolicy};
 const SETUP_DIRECTORY: &str = "federation-setup";
 const SETUP_CONFIG_FILE: &str = "setup.json";
 const SETUP_STATE_DIRECTORY: &str = "state";
+const ABORTED_DIRECTORY: &str = "aborted";
 const SQLITE_DATABASE_FILE: &str = "cdk-mintd.sqlite";
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const WATCHER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -414,6 +415,10 @@ impl SetupMode {
 
     async fn stop_workers(&self) {
         let mut workers = self.workers.lock().await;
+        self.clear_workers(&mut workers).await;
+    }
+
+    async fn clear_workers(&self, workers: &mut SetupWorkers) {
         if let Some(dkg) = workers.dkg.take() {
             dkg.shutdown().await;
         }
@@ -422,6 +427,29 @@ impl SetupMode {
         }
         self.routes.set_dkg(None);
         self.routes.set_coordinator(None);
+    }
+
+    /// Move an aborted setup's files aside so a new setup can start.
+    ///
+    /// The state directory moves first: a config without its state only fails to
+    /// load, but state left without its config would be reused by the next setup.
+    fn archive_setup(&self, setup_id: FederationSetupId) -> Result<()> {
+        let archive = self
+            .work_dir
+            .join(SETUP_DIRECTORY)
+            .join(ABORTED_DIRECTORY)
+            .join(setup_id.to_string());
+        create_private_dir(&archive)?;
+        for (source, name) in [
+            (&self.state_dir, SETUP_STATE_DIRECTORY),
+            (&self.config_path, SETUP_CONFIG_FILE),
+        ] {
+            if source.exists() {
+                std::fs::rename(source, archive.join(name))
+                    .with_context(|| format!("failed to move {} aside", source.display()))?;
+            }
+        }
+        Ok(())
     }
 
     fn url_or_default(&self, value: Option<&str>, fallback: &str, label: &str) -> Result<MintUrl> {
@@ -736,6 +764,32 @@ impl FederationSetupProvider for SetupModeProvider {
         .await
         .map_err(failed_precondition)?;
         Ok(status_response(&config, status))
+    }
+
+    async fn abort_setup(
+        &self,
+        request: proto::AbortSetupRequest,
+    ) -> Result<proto::AbortSetupResponse, ProviderError> {
+        let mode = &self.mode;
+        let mut workers = mode.workers.lock().await;
+        let setup_id = FederationSetupId::from_str(request.setup_id.trim())
+            .context("invalid setup ID")
+            .map_err(invalid_argument)?;
+        mode.require_local_config().map_err(failed_precondition)?;
+        abort_setup(
+            mode.database.as_ref(),
+            &mode.config_path,
+            setup_id,
+            current_unix_time().map_err(internal)?,
+        )
+        .await
+        .map_err(failed_precondition)?;
+        mode.clear_workers(&mut workers).await;
+        mode.archive_setup(setup_id).map_err(internal)?;
+        tracing::info!(%setup_id, "Federation setup aborted");
+        Ok(proto::AbortSetupResponse {
+            setup_id: setup_id.to_string(),
+        })
     }
 
     async fn activate_setup(

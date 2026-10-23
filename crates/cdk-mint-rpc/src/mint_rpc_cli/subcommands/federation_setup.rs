@@ -10,9 +10,9 @@ use tonic::Request;
 use super::output::{list, number, text, OutputCommand};
 use crate::federation_setup::federation_setup_service_client::FederationSetupServiceClient;
 use crate::federation_setup::{
-    ActivateSetupRequest, ApproveProposalRequest, CreateSetupRequest, GetSetupStatusRequest,
-    GetSetupStatusResponse, JoinSetupRequest, ProposeSetupRequest, ReplaceInvitationRequest,
-    ReviewProposalRequest, SetupKeyset,
+    AbortSetupRequest, ActivateSetupRequest, ApproveProposalRequest, CreateSetupRequest,
+    GetSetupStatusRequest, GetSetupStatusResponse, JoinSetupRequest, ProposeSetupRequest,
+    ReplaceInvitationRequest, ReviewProposalRequest, SetupKeyset,
 };
 
 /// Largest invitation file the CLI will read.
@@ -35,6 +35,8 @@ pub enum FederationSetupCommand {
     Approve(ApproveSetupCommand),
     /// Show setup and key generation progress
     Status(OutputCommand),
+    /// Abandon the current setup so this daemon can create or join a new one
+    Abort(AbortSetupCommand),
     /// Activate the finished federation and restart as a federation member
     Activate,
 }
@@ -122,6 +124,14 @@ pub struct ApproveSetupCommand {
     proposal_hash: String,
 }
 
+/// Arguments for aborting a setup.
+#[derive(Debug, Args)]
+pub struct AbortSetupCommand {
+    /// Setup ID shown by `status`
+    #[arg(long)]
+    setup_id: String,
+}
+
 /// Runs one federation setup command.
 pub async fn federation_setup(
     client: &mut FederationSetupServiceClient<Channel>,
@@ -135,6 +145,7 @@ pub async fn federation_setup(
         FederationSetupCommand::Review(args) => review(client, args).await,
         FederationSetupCommand::Approve(args) => approve(client, args).await,
         FederationSetupCommand::Status(args) => status(client, args).await,
+        FederationSetupCommand::Abort(args) => abort(client, args).await,
         FederationSetupCommand::Activate => activate(client).await,
     }
 }
@@ -330,6 +341,22 @@ async fn status(
         true => println!("{}", serde_json::to_string_pretty(&status_json(&status))?),
         false => print_status(&status),
     }
+
+    Ok(())
+}
+
+async fn abort(
+    client: &mut FederationSetupServiceClient<Channel>,
+    args: &AbortSetupCommand,
+) -> Result<()> {
+    let response = client
+        .abort_setup(Request::new(AbortSetupRequest {
+            setup_id: args.setup_id.clone(),
+        }))
+        .await?
+        .into_inner();
+
+    println!("aborted_setup_id: {}", escape_control(&response.setup_id));
 
     Ok(())
 }

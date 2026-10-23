@@ -7,9 +7,10 @@
 # come back, in the same process, as a running federation member on the same RPC
 # port, and the federation must pass the paid mint/swap/melt smoke scenario.
 #
-# The coordinator replaces the last member's invitation before that member
-# joins, and every member's status must show the same identity fingerprint the
-# proposal review lists for it.
+# Before the real setup, member 1 creates a throwaway setup that member 2 joins,
+# and both abort it. In the real setup the coordinator replaces the last member's
+# invitation before that member joins, and every member's status must show the
+# same identity fingerprint the proposal review lists for it.
 #
 # TRANSPORT=http (default) runs federation traffic over local HTTP. TRANSPORT=iroh
 # makes every member Iroh-only for enrollment, key generation, and consensus;
@@ -391,6 +392,27 @@ for member in $(seq 1 "$MEMBERS"); do
         || die "member $member was not a fresh setup"
 done
 
+printf 'Creating a throwaway setup, joining member 2, then aborting it on both...\n'
+setup_cli 1 federation-setup create \
+    --members "$MEMBERS" \
+    --threshold "$THRESHOLD" \
+    --network regtest \
+    --output-dir "$FED_DIR/aborted-invitations" \
+    $(setup_url_args 1) \
+    >"$(member_dir 1)/aborted-create.log"
+aborted_setup_id="$(sed -n 's/^setup_id: //p' "$(member_dir 1)/aborted-create.log")"
+setup_cli 2 federation-setup join \
+    --invitation-file "$FED_DIR/aborted-invitations/member-2.invite" \
+    $(setup_url_args 2) \
+    >"$(member_dir 2)/aborted-join.log"
+for member in 2 1; do
+    setup_cli "$member" federation-setup abort --setup-id "$aborted_setup_id" \
+        >"$(member_dir "$member")/abort.log"
+    setup_cli "$member" federation-setup status --json >"$(member_dir "$member")/status.json"
+    [[ "$(jq -r '.initialized' "$(member_dir "$member")/status.json")" == "false" ]] \
+        || die "member $member still reports a setup after aborting it"
+done
+
 printf 'Creating the setup on member 1 over gRPC...\n'
 setup_cli 1 federation-setup create \
     --members "$MEMBERS" \
@@ -399,6 +421,8 @@ setup_cli 1 federation-setup create \
     --output-dir "$FED_DIR/invitations" \
     $(setup_url_args 1) \
     >"$(member_dir 1)/create.log"
+[[ "$(sed -n 's/^setup_id: //p' "$(member_dir 1)/create.log")" != "$aborted_setup_id" ]] \
+    || die "the new setup reused the aborted setup ID"
 
 printf 'Replacing member %s invitation over gRPC...\n' "$MEMBERS"
 replaced_invitation="$FED_DIR/invitations/member-$MEMBERS.invite"

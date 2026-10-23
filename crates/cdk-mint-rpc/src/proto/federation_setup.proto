@@ -28,6 +28,12 @@ service FederationSetupService {
     // Returns the local setup state. Before CreateSetup or JoinSetup it
     // returns initialized = false instead of an error.
     rpc GetSetupStatus(GetSetupStatusRequest) returns (GetSetupStatusResponse) {}
+    // Abandons the current setup so this daemon can create or join a new one.
+    // The coordinator can abort until every member has approved, and a member
+    // until it has received the certified manifest, so no key generation can
+    // have started. Other members are not told: each operator aborts on their
+    // own daemon, and a new setup gets a new setup ID.
+    rpc AbortSetup(AbortSetupRequest) returns (AbortSetupResponse) {}
     // Activates the finished federation config once key generation is
     // complete. The daemon then restarts as a federation member.
     rpc ActivateSetup(ActivateSetupRequest) returns (ActivateSetupResponse) {}
@@ -274,6 +280,17 @@ message GetSetupStatusResponse {
     // member's identity key. Share it with the other operators so they can
     // match it against this member in ReviewProposal.
     optional string identity_fingerprint = 16;
+}
+
+message AbortSetupRequest {
+    // Identifier of the setup to abort, as shown by GetSetupStatus. A request
+    // for any other setup is rejected.
+    string setup_id = 1;
+}
+
+message AbortSetupResponse {
+    // Identifier of the aborted setup.
+    string setup_id = 1;
 }
 
 message ActivateSetupRequest {

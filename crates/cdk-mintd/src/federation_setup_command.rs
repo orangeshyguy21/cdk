@@ -2736,6 +2736,70 @@ where
     Ok(invitation)
 }
 
+/// Abort the local setup before key generation can have started.
+///
+/// The coordinator can abort until every member has approved, and every member
+/// until it has stored the certified manifest. Aborting an aborted setup
+/// succeeds, so an interrupted abort can be retried.
+#[cfg(all(feature = "sqlite", feature = "management-rpc"))]
+pub(crate) async fn abort_setup<DB>(
+    db: &DB,
+    config_path: &Path,
+    setup_id: FederationSetupId,
+    now_unix: u64,
+) -> Result<()>
+where
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
+{
+    use cdk_common::federation::FederationSetupCoordinatorPhase;
+
+    let config = read_local_config(config_path)?;
+    if config.setup_id != setup_id {
+        bail!("setup {setup_id} is not the current setup");
+    }
+    let session = require_local_session(db, &config).await?;
+    if session.participant_phase == FederationSetupParticipantPhase::Aborted {
+        return Ok(());
+    }
+    let before_certification = matches!(
+        session.participant_phase,
+        FederationSetupParticipantPhase::IdentityCreated
+            | FederationSetupParticipantPhase::Enrolled
+            | FederationSetupParticipantPhase::ProposalReviewed
+            | FederationSetupParticipantPhase::Approved
+    ) && !matches!(
+        session.coordinator_phase,
+        Some(FederationSetupCoordinatorPhase::Certified | FederationSetupCoordinatorPhase::Closed)
+    ) && !config.manifest_path.exists();
+    if !before_certification {
+        bail!("the setup is certified and key generation may have started, so it can no longer be aborted");
+    }
+    // One session transition advances one lifecycle, so the coordinator and the
+    // participant abort in two steps of the same transaction.
+    let mut tx = Database::begin_transaction(db)
+        .await
+        .context("failed to begin setup abort transaction")?;
+    let mut current = session;
+    if current.coordinator_phase.is_some() {
+        let aborted = current
+            .with_coordinator_phase(FederationSetupCoordinatorPhase::Aborted, now_unix)
+            .context("failed to construct the aborted coordinator phase")?;
+        tx.transition_federation_setup_session(&current, &aborted)
+            .await
+            .context("failed to persist the aborted coordinator phase")?;
+        current = aborted;
+    }
+    let aborted = current
+        .with_participant_phase(FederationSetupParticipantPhase::Aborted, now_unix)
+        .context("failed to construct the aborted setup phase")?;
+    tx.transition_federation_setup_session(&current, &aborted)
+        .await
+        .context("failed to persist the aborted setup phase")?;
+    tx.commit()
+        .await
+        .context("failed to commit the aborted setup")
+}
+
 pub(crate) fn read_local_config(config_path: &Path) -> Result<FederationSetupLocalConfig> {
     let config = read_private_json_file(config_path, "federation setup config")?;
     FederationSetupLocalConfig::validate(&config)?;

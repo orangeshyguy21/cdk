@@ -16,11 +16,11 @@ use crate::federation_setup::federation_setup_service_server::{
     FederationSetupService, FederationSetupServiceServer,
 };
 use crate::federation_setup::{
-    ActivateSetupRequest, ActivateSetupResponse, ApproveProposalRequest, ApproveProposalResponse,
-    CreateSetupRequest, CreateSetupResponse, GetSetupStatusRequest, GetSetupStatusResponse,
-    JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest, ProposeSetupResponse,
-    ReplaceInvitationRequest, ReplaceInvitationResponse, ReviewProposalRequest,
-    ReviewProposalResponse,
+    AbortSetupRequest, AbortSetupResponse, ActivateSetupRequest, ActivateSetupResponse,
+    ApproveProposalRequest, ApproveProposalResponse, CreateSetupRequest, CreateSetupResponse,
+    GetSetupStatusRequest, GetSetupStatusResponse, JoinSetupRequest, JoinSetupResponse,
+    ProposeSetupRequest, ProposeSetupResponse, ReplaceInvitationRequest, ReplaceInvitationResponse,
+    ReviewProposalRequest, ReviewProposalResponse,
 };
 use crate::DynFederationSetupProvider;
 
@@ -239,6 +239,18 @@ impl FederationSetupService for SetupServiceHandler {
             .map_err(Status::from)
     }
 
+    /// Abandons the current setup before key generation can have started.
+    async fn abort_setup(
+        &self,
+        request: Request<AbortSetupRequest>,
+    ) -> Result<Response<AbortSetupResponse>, Status> {
+        self.provider
+            .abort_setup(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(Status::from)
+    }
+
     /// Activates the finished federation config.
     async fn activate_setup(
         &self,
@@ -265,11 +277,11 @@ mod tests {
     use super::FederationSetupRPCServer;
     use crate::federation_setup::federation_setup_service_client::FederationSetupServiceClient;
     use crate::federation_setup::{
-        ActivateSetupRequest, ActivateSetupResponse, ApproveProposalRequest,
-        ApproveProposalResponse, CreateSetupRequest, CreateSetupResponse, GetSetupStatusRequest,
-        GetSetupStatusResponse, JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest,
-        ProposeSetupResponse, ReplaceInvitationRequest, ReplaceInvitationResponse,
-        ReviewProposalRequest, ReviewProposalResponse,
+        AbortSetupRequest, AbortSetupResponse, ActivateSetupRequest, ActivateSetupResponse,
+        ApproveProposalRequest, ApproveProposalResponse, CreateSetupRequest, CreateSetupResponse,
+        GetSetupStatusRequest, GetSetupStatusResponse, JoinSetupRequest, JoinSetupResponse,
+        ProposeSetupRequest, ProposeSetupResponse, ReplaceInvitationRequest,
+        ReplaceInvitationResponse, ReviewProposalRequest, ReviewProposalResponse,
     };
     use crate::{FederationSetupProvider, ProviderError};
 
@@ -329,6 +341,13 @@ mod tests {
                 initialized: false,
                 ..Default::default()
             })
+        }
+
+        async fn abort_setup(
+            &self,
+            _request: AbortSetupRequest,
+        ) -> Result<AbortSetupResponse, ProviderError> {
+            Err(ProviderError::failed_precondition("no setup"))
         }
 
         async fn activate_setup(
