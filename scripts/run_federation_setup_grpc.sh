@@ -7,6 +7,9 @@
 # come back, in the same process, as a running federation member on the same RPC
 # port, and the federation must pass the paid mint/swap/melt smoke scenario.
 #
+# Every member's status must show the same identity fingerprint the proposal
+# review lists for it.
+#
 # TRANSPORT=http (default) runs federation traffic over local HTTP. TRANSPORT=iroh
 # makes every member Iroh-only for enrollment, key generation, and consensus;
 # the management gRPC stays on localhost TCP either way.
@@ -416,6 +419,12 @@ for member in "${approve_order[@]}"; do
     setup_cli "$member" federation-setup review --json >"$(member_dir "$member")/review.json"
     [[ "$(jq -r '.proposal_hash' "$(member_dir "$member")/review.json")" == "$proposal_hash" ]] \
         || die "member $member reviewed another proposal"
+    setup_cli "$member" federation-setup status --json >"$(member_dir "$member")/status.json"
+    [[ "$(jq -r '.identity_fingerprint' "$(member_dir "$member")/status.json")" \
+        == "$(jq -r --argjson member "$member" \
+            '.members[] | select(.member_id == $member) | .identity_fingerprint' \
+            "$(member_dir "$member")/review.json")" ]] \
+        || die "member $member status shows another identity fingerprint than the review"
     setup_cli "$member" federation-setup approve --proposal-hash "$proposal_hash" \
         >"$(member_dir "$member")/approve.log"
 done

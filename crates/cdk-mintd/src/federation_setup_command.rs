@@ -1108,6 +1108,7 @@ pub(crate) struct FederationSetupCommandStatus {
     pub(crate) version: u16,
     pub(crate) setup_id: FederationSetupId,
     pub(crate) member_id: MemberId,
+    pub(crate) identity_fingerprint: String,
     pub(crate) participant_phase: String,
     pub(crate) coordinator_phase: Option<String>,
     pub(crate) member_count: u16,
@@ -1217,10 +1218,14 @@ async fn build_setup_command_status(
         .filter(|member| !approved_members.contains(member))
         .copied()
         .collect();
+    let secrets: FederationSetupLocalSecrets =
+        read_private_json_file(&config.secrets_path, "federation setup secrets")?;
+    secrets.validate(config, now_unix)?;
     Ok(FederationSetupCommandStatus {
         version: 1,
         setup_id: config.setup_id,
         member_id: config.local_role.member_id(),
+        identity_fingerprint: secrets.enrollment.identity_fingerprint(),
         participant_phase: participant_phase_label(session.participant_phase).to_string(),
         coordinator_phase: session
             .coordinator_phase
@@ -1242,6 +1247,7 @@ async fn build_setup_command_status(
 fn print_setup_status(status: &FederationSetupCommandStatus) {
     println!("setup_id: {}", status.setup_id);
     println!("member_id: {}", status.member_id);
+    println!("identity_fingerprint: {}", status.identity_fingerprint);
     println!("participant_phase: {}", status.participant_phase);
     if let Some(phase) = status.coordinator_phase.as_deref() {
         println!("coordinator_phase: {phase}");

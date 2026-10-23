@@ -255,6 +255,10 @@ message GetSetupStatusResponse {
     optional SetupDkgProgress dkg = 14;
     // Activation record, once this daemon has activated.
     optional SetupActivation activation = 15;
+    // First 16 lowercase hex characters of the SHA-256 fingerprint of this
+    // member's identity key. Share it with the other operators so they can
+    // match it against this member in ReviewProposal.
+    optional string identity_fingerprint = 16;
 }
 
 message ActivateSetupRequest {

@@ -833,6 +833,13 @@ impl FederationSetupEnrollment {
         Ok(enrollment)
     }
 
+    /// First 16 lowercase hex characters of the identity key's SHA-256
+    /// fingerprint, which operators compare out of band.
+    pub fn identity_fingerprint(&self) -> String {
+        let hash = Sha256Hash::hash(&self.identity_public_key.to_bytes()).to_string();
+        hash[..16].to_string()
+    }
+
     /// Validate structure, URL policy, protocol support, size, and identity signature.
     pub fn validate(&self, url_policy: FederationSetupUrlPolicy) -> Result<()> {
         validate_setup_version("enrollment", self.version)?;

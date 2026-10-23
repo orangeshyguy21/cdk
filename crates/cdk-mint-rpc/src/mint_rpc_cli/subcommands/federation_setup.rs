@@ -321,6 +321,10 @@ fn print_status(status: &GetSetupStatusResponse) {
     }
     println!("setup_id: {}", text(status.setup_id.as_deref()));
     println!("member_id: {}", number(status.member_id));
+    println!(
+        "identity_fingerprint: {}",
+        text(status.identity_fingerprint.as_deref())
+    );
     println!("role: {}", escape_control(&status.role));
     println!(
         "participant_phase: {}",
@@ -373,6 +377,7 @@ fn status_json(status: &GetSetupStatusResponse) -> serde_json::Value {
         "initialized": status.initialized,
         "setup_id": status.setup_id,
         "member_id": status.member_id,
+        "identity_fingerprint": status.identity_fingerprint,
         "role": status.role,
         "participant_phase": status.participant_phase,
         "coordinator_phase": status.coordinator_phase,

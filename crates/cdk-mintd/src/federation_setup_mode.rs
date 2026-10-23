@@ -829,6 +829,7 @@ fn status_response(
         initialized: true,
         setup_id: Some(status.setup_id.to_string()),
         member_id: Some(u32::from(status.member_id.get())),
+        identity_fingerprint: Some(status.identity_fingerprint),
         role: role.to_string(),
         participant_phase: status.participant_phase,
         coordinator_phase: status.coordinator_phase,

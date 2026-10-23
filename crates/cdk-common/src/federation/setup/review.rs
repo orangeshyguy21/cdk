@@ -83,7 +83,7 @@ impl FederationSetupProposalReview {
                 member_id: enrollment.member_id,
                 public_mint_url: enrollment.public_mint_url.to_string(),
                 federation_api_url: enrollment.federation_api_url.to_string(),
-                identity_fingerprint: identity_fingerprint(&enrollment.identity_public_key),
+                identity_fingerprint: enrollment.identity_fingerprint(),
             })
             .collect();
         let review = Self {
@@ -236,11 +236,6 @@ impl fmt::Display for FederationSetupProposalReview {
         }
         Ok(())
     }
-}
-
-fn identity_fingerprint(key: &crate::nuts::nut01::PublicKey) -> String {
-    let hash = sha256::Hash::hash(&key.to_bytes()).to_string();
-    hash[..16].to_string()
 }
 
 fn application_configuration_fingerprint(configuration: &serde_json::Value) -> String {
