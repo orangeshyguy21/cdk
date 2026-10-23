@@ -11,8 +11,8 @@ use super::output::{list, number, text, OutputCommand};
 use crate::federation_setup::federation_setup_service_client::FederationSetupServiceClient;
 use crate::federation_setup::{
     ActivateSetupRequest, ApproveProposalRequest, CreateSetupRequest, GetSetupStatusRequest,
-    GetSetupStatusResponse, JoinSetupRequest, ProposeSetupRequest, ReviewProposalRequest,
-    SetupKeyset,
+    GetSetupStatusResponse, JoinSetupRequest, ProposeSetupRequest, ReplaceInvitationRequest,
+    ReviewProposalRequest, SetupKeyset,
 };
 
 /// Largest invitation file the CLI will read.
@@ -23,6 +23,8 @@ const MAX_INVITATION_FILE_BYTES: u64 = 64 * 1024;
 pub enum FederationSetupCommand {
     /// Create a new federation setup with this daemon as the coordinator
     Create(CreateSetupCommand),
+    /// Replace the invitation for a member that has not joined yet (coordinator only)
+    ReplaceInvitation(ReplaceInvitationCommand),
     /// Join a federation setup using an invitation file
     Join(JoinSetupCommand),
     /// Freeze every enrollment into one proposal (coordinator only)
@@ -84,6 +86,17 @@ pub struct CreateSetupCommand {
     allow_insecure_localhost: bool,
 }
 
+/// Arguments for replacing an invitation.
+#[derive(Debug, Args)]
+pub struct ReplaceInvitationCommand {
+    /// Member slot whose invitation is replaced
+    #[arg(long)]
+    member: u32,
+    /// File to write the new invitation to
+    #[arg(long)]
+    output: PathBuf,
+}
+
 /// Arguments for joining a federation setup.
 #[derive(Debug, Args)]
 pub struct JoinSetupCommand {
@@ -116,6 +129,7 @@ pub async fn federation_setup(
 ) -> Result<()> {
     match command {
         FederationSetupCommand::Create(args) => create(client, args).await,
+        FederationSetupCommand::ReplaceInvitation(args) => replace_invitation(client, args).await,
         FederationSetupCommand::Join(args) => join(client, args).await,
         FederationSetupCommand::Propose => propose(client).await,
         FederationSetupCommand::Review(args) => review(client, args).await,
@@ -167,6 +181,32 @@ async fn create(
             path.display()
         );
     }
+
+    Ok(())
+}
+
+async fn replace_invitation(
+    client: &mut FederationSetupServiceClient<Channel>,
+    args: &ReplaceInvitationCommand,
+) -> Result<()> {
+    let response = client
+        .replace_invitation(Request::new(ReplaceInvitationRequest {
+            member_id: args.member,
+        }))
+        .await?
+        .into_inner();
+    let invitation = response
+        .invitation
+        .context("server returned no invitation")?;
+
+    write_private_file(&args.output, &format!("{}\n", invitation.invitation))?;
+    println!("member_id: {}", invitation.member_id);
+    println!("expires_at_unix: {}", invitation.expires_at_unix);
+    println!(
+        "member_{}_invitation: {}",
+        invitation.member_id,
+        args.output.display()
+    );
 
     Ok(())
 }

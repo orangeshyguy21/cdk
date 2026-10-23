@@ -2711,6 +2711,31 @@ where
     Ok(invitation)
 }
 
+/// Replace the invitation for a member that has not joined, then make the new
+/// invitation the member's current invitation file.
+///
+/// The new invitation is written to a pending file before it is stored, so a
+/// retry after an interruption stores the same invitation instead of a third one.
+#[cfg(all(feature = "sqlite", feature = "management-rpc"))]
+pub(crate) async fn replace_invitation<DB>(
+    db: &DB,
+    config_path: &Path,
+    state_directory: &Path,
+    member_id: MemberId,
+    now_unix: u64,
+) -> Result<FederationSetupInvitation>
+where
+    DB: Database<DatabaseError> + Send + Sync + ?Sized + 'static,
+{
+    let directory = state_directory.join(LOCAL_SETUP_INVITATION_DIRECTORY);
+    let current = directory.join(format!("member-{}.invite", member_id.get()));
+    let pending = directory.join(format!("member-{}.invite.pending", member_id.get()));
+    let invitation = issue_invitation(db, config_path, member_id, true, &pending, now_unix).await?;
+    std::fs::rename(&pending, &current)
+        .context("failed to store the replacement invitation file")?;
+    Ok(invitation)
+}
+
 pub(crate) fn read_local_config(config_path: &Path) -> Result<FederationSetupLocalConfig> {
     let config = read_private_json_file(config_path, "federation setup config")?;
     FederationSetupLocalConfig::validate(&config)?;

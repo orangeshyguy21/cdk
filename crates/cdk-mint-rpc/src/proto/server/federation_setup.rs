@@ -19,7 +19,8 @@ use crate::federation_setup::{
     ActivateSetupRequest, ActivateSetupResponse, ApproveProposalRequest, ApproveProposalResponse,
     CreateSetupRequest, CreateSetupResponse, GetSetupStatusRequest, GetSetupStatusResponse,
     JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest, ProposeSetupResponse,
-    ReviewProposalRequest, ReviewProposalResponse,
+    ReplaceInvitationRequest, ReplaceInvitationResponse, ReviewProposalRequest,
+    ReviewProposalResponse,
 };
 use crate::DynFederationSetupProvider;
 
@@ -166,6 +167,18 @@ impl FederationSetupService for SetupServiceHandler {
             .map_err(Status::from)
     }
 
+    /// Replaces the invitation for a member that has not joined yet.
+    async fn replace_invitation(
+        &self,
+        request: Request<ReplaceInvitationRequest>,
+    ) -> Result<Response<ReplaceInvitationResponse>, Status> {
+        self.provider
+            .replace_invitation(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(Status::from)
+    }
+
     /// Joins a setup using an invitation from the coordinator.
     async fn join_setup(
         &self,
@@ -255,7 +268,8 @@ mod tests {
         ActivateSetupRequest, ActivateSetupResponse, ApproveProposalRequest,
         ApproveProposalResponse, CreateSetupRequest, CreateSetupResponse, GetSetupStatusRequest,
         GetSetupStatusResponse, JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest,
-        ProposeSetupResponse, ReviewProposalRequest, ReviewProposalResponse,
+        ProposeSetupResponse, ReplaceInvitationRequest, ReplaceInvitationResponse,
+        ReviewProposalRequest, ReviewProposalResponse,
     };
     use crate::{FederationSetupProvider, ProviderError};
 
@@ -270,6 +284,13 @@ mod tests {
             _request: CreateSetupRequest,
         ) -> Result<CreateSetupResponse, ProviderError> {
             Err(ProviderError::invalid_argument("threshold too high"))
+        }
+
+        async fn replace_invitation(
+            &self,
+            _request: ReplaceInvitationRequest,
+        ) -> Result<ReplaceInvitationResponse, ProviderError> {
+            Err(ProviderError::failed_precondition("member already joined"))
         }
 
         async fn join_setup(

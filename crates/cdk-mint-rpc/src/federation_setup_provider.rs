@@ -8,7 +8,8 @@ use crate::federation_setup::{
     ActivateSetupRequest, ActivateSetupResponse, ApproveProposalRequest, ApproveProposalResponse,
     CreateSetupRequest, CreateSetupResponse, GetSetupStatusRequest, GetSetupStatusResponse,
     JoinSetupRequest, JoinSetupResponse, ProposeSetupRequest, ProposeSetupResponse,
-    ReviewProposalRequest, ReviewProposalResponse,
+    ReplaceInvitationRequest, ReplaceInvitationResponse, ReviewProposalRequest,
+    ReviewProposalResponse,
 };
 use crate::ProviderError;
 
@@ -20,6 +21,12 @@ pub trait FederationSetupProvider {
         &self,
         request: CreateSetupRequest,
     ) -> Result<CreateSetupResponse, ProviderError>;
+
+    /// Replaces the invitation for a member that has not joined yet.
+    async fn replace_invitation(
+        &self,
+        request: ReplaceInvitationRequest,
+    ) -> Result<ReplaceInvitationResponse, ProviderError>;
 
     /// Joins a setup using an invitation from the coordinator.
     async fn join_setup(

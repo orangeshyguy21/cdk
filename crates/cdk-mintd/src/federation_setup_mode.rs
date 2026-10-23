@@ -23,6 +23,7 @@ use cdk_common::federation::{
     is_iroh_setup_url, FederationDkgCeremonyRecord, FederationSetupActivation,
     FederationSetupBitcoinNetwork, FederationSetupInvitation, FederationSetupLocalRole,
     FederationSetupParticipantPhase, FederationSetupProposalHash, FederationSetupProposalReview,
+    MemberId,
 };
 use cdk_common::mint_url::MintUrl;
 use cdk_mint_rpc::federation_setup as proto;
@@ -38,9 +39,9 @@ use crate::federation_setup_command::{
     activate_setup_with_db, approve_setup, build_certified_dkg_router,
     build_setup_coordinator_router, create_setup, current_unix_time, fetch_and_review_proposal,
     join_setup, parse_mint_url, propose_setup, read_local_config, refresh_certified_manifest,
-    review_local_proposal, serve_setup_router, setup_status_with_db, setup_url_policy,
-    FederationSetupActivationResult, FederationSetupCommandStatus, FederationSetupCreateParams,
-    FederationSetupLocalConfig, HttpSetupCoordinator, SetupServeEnd,
+    replace_invitation, review_local_proposal, serve_setup_router, setup_status_with_db,
+    setup_url_policy, FederationSetupActivationResult, FederationSetupCommandStatus,
+    FederationSetupCreateParams, FederationSetupLocalConfig, HttpSetupCoordinator, SetupServeEnd,
 };
 use crate::{config, BdkWalletPolicy};
 
@@ -553,14 +554,32 @@ impl FederationSetupProvider for SetupModeProvider {
         Ok(proto::CreateSetupResponse {
             setup_id: created.setup_id.to_string(),
             member_id: 1,
-            invitations: created
-                .invitations
-                .iter()
-                .map(|(member_id, invitation)| proto::SetupInvitation {
-                    member_id: u32::from(member_id.get()),
-                    invitation: invitation.to_string(),
-                })
-                .collect(),
+            invitations: created.invitations.values().map(setup_invitation).collect(),
+        })
+    }
+
+    async fn replace_invitation(
+        &self,
+        request: proto::ReplaceInvitationRequest,
+    ) -> Result<proto::ReplaceInvitationResponse, ProviderError> {
+        let mode = &self.mode;
+        let _workers = mode.workers.lock().await;
+        let member_id = u16::try_from(request.member_id)
+            .ok()
+            .and_then(|member| MemberId::new(member).ok())
+            .ok_or_else(|| ProviderError::invalid_argument("member_id is not a member slot"))?;
+        mode.require_local_config().map_err(failed_precondition)?;
+        let invitation = replace_invitation(
+            mode.database.as_ref(),
+            &mode.config_path,
+            &mode.state_dir,
+            member_id,
+            current_unix_time().map_err(internal)?,
+        )
+        .await
+        .map_err(failed_precondition)?;
+        Ok(proto::ReplaceInvitationResponse {
+            invitation: Some(setup_invitation(&invitation)),
         })
     }
 
@@ -769,6 +788,14 @@ fn parse_network(value: &str) -> Result<FederationSetupBitcoinNetwork> {
     match value.trim().to_ascii_lowercase().as_str() {
         "mainnet" => Ok(FederationSetupBitcoinNetwork::Bitcoin),
         name => Ok(FederationSetupBitcoinNetwork::from_str(name)?),
+    }
+}
+
+fn setup_invitation(invitation: &FederationSetupInvitation) -> proto::SetupInvitation {
+    proto::SetupInvitation {
+        member_id: u32::from(invitation.member_id.get()),
+        invitation: invitation.to_string(),
+        expires_at_unix: invitation.expires_at_unix,
     }
 }
 

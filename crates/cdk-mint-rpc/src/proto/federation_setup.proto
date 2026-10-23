@@ -10,6 +10,9 @@ service FederationSetupService {
     // Starts a new setup with this daemon as the coordinator and member 1.
     // Returns one invitation per other member.
     rpc CreateSetup(CreateSetupRequest) returns (CreateSetupResponse) {}
+    // Replaces the invitation for a member that has not joined yet. The old
+    // invitation stops working. Coordinator only.
+    rpc ReplaceInvitation(ReplaceInvitationRequest) returns (ReplaceInvitationResponse) {}
     // Joins a setup started by another daemon, using the invitation the
     // coordinator issued for this member.
     rpc JoinSetup(JoinSetupRequest) returns (JoinSetupResponse) {}
@@ -50,6 +53,8 @@ message SetupInvitation {
     // Encoded invitation to pass to JoinSetup on that member. Treat it as a
     // secret until the member has joined.
     string invitation = 2;
+    // When the invitation stops working, as seconds since the UNIX epoch.
+    uint64 expires_at_unix = 3;
 }
 
 message CreateSetupRequest {
@@ -89,6 +94,16 @@ message CreateSetupResponse {
     uint32 member_id = 2;
     // One invitation per joining member, ordered by member_id.
     repeated SetupInvitation invitations = 3;
+}
+
+message ReplaceInvitationRequest {
+    // Member slot whose invitation is replaced.
+    uint32 member_id = 1;
+}
+
+message ReplaceInvitationResponse {
+    // The new invitation for that member.
+    SetupInvitation invitation = 1;
 }
 
 message JoinSetupRequest {

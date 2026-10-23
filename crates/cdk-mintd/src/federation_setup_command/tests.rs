@@ -1225,6 +1225,58 @@ fn protected_setup_reader_rejects_weak_permissions_symlinks_and_oversized_files(
     .is_err());
 }
 
+#[cfg(feature = "management-rpc")]
+#[tokio::test]
+async fn replacing_an_invitation_keeps_the_member_invitation_file_current() {
+    let root = TempDir::new().expect("test directory");
+    let config = root.path().join("setup.json");
+    let db_path = root.path().join("mint.sqlite");
+    let db = MintSqliteDatabase::new(db_path.clone())
+        .await
+        .expect("creator database");
+    let created = create_setup(
+        &db,
+        &config,
+        root.path(),
+        &db_path,
+        &create_spec(),
+        NOW_UNIX,
+    )
+    .await
+    .expect("creator setup");
+    let member_two = MemberId::new(2).expect("member two ID");
+    let path = created
+        .invitation_paths
+        .get(&member_two)
+        .expect("member two invitation path")
+        .clone();
+    let original = read_invitation(&path);
+
+    let first = replace_invitation(&db, &config, root.path(), member_two, NOW_UNIX)
+        .await
+        .expect("first replacement");
+    let second = replace_invitation(&db, &config, root.path(), member_two, NOW_UNIX + 1)
+        .await
+        .expect("second replacement");
+
+    assert_ne!(first.invitation_id, original.invitation_id);
+    assert_ne!(second.invitation_id, first.invitation_id);
+    assert_eq!(read_invitation(&path), second);
+    assert!(!path.with_extension("invite.pending").exists());
+    let available = db
+        .get_federation_setup_invitations(created.setup_id)
+        .await
+        .expect("setup invitations")
+        .into_iter()
+        .filter(|invitation| {
+            invitation.member_id == member_two
+                && invitation.state == FederationSetupInvitationState::Available
+        })
+        .map(|invitation| invitation.invitation_id)
+        .collect::<Vec<_>>();
+    assert_eq!(available, vec![second.invitation_id]);
+}
+
 fn create_spec() -> FederationSetupCreateSpec {
     let thresholds = ThresholdParams::with_bft_consensus(3, 2).expect("safe thresholds");
     let applications = Vec::new();

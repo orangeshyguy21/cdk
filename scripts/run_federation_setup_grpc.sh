@@ -7,8 +7,9 @@
 # come back, in the same process, as a running federation member on the same RPC
 # port, and the federation must pass the paid mint/swap/melt smoke scenario.
 #
-# Every member's status must show the same identity fingerprint the proposal
-# review lists for it.
+# The coordinator replaces the last member's invitation before that member
+# joins, and every member's status must show the same identity fingerprint the
+# proposal review lists for it.
 #
 # TRANSPORT=http (default) runs federation traffic over local HTTP. TRANSPORT=iroh
 # makes every member Iroh-only for enrollment, key generation, and consensus;
@@ -398,6 +399,16 @@ setup_cli 1 federation-setup create \
     --output-dir "$FED_DIR/invitations" \
     $(setup_url_args 1) \
     >"$(member_dir 1)/create.log"
+
+printf 'Replacing member %s invitation over gRPC...\n' "$MEMBERS"
+replaced_invitation="$FED_DIR/invitations/member-$MEMBERS.invite"
+cp -p "$replaced_invitation" "$replaced_invitation.original"
+setup_cli 1 federation-setup replace-invitation \
+    --member "$MEMBERS" \
+    --output "$replaced_invitation" \
+    >"$(member_dir 1)/replace-invitation.log"
+! cmp -s "$replaced_invitation" "$replaced_invitation.original" \
+    || die "the replacement invitation matches the original"
 
 printf 'Joining members 2..%s over gRPC...\n' "$MEMBERS"
 for member in $(seq 2 "$MEMBERS"); do
